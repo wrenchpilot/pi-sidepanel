@@ -27,7 +27,7 @@ import type {
 	TurnStartEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
-import { HStack, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { HStack, sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 /* ──────────────────────────────────────────────────────── constants ── */
 
@@ -88,6 +88,11 @@ function renderSeals(theme: Theme, percent: number, now = Date.now()): string {
 	return out;
 }
 
+const piLensState = {
+	currentFile: "",
+	languages: new Set<string>(),
+};
+
 function displayPath(target: string | undefined): string {
 	if (!target) return "—";
 	const home = homedir();
@@ -96,9 +101,51 @@ function displayPath(target: string | undefined): string {
 	return target;
 }
 
+function piLensLanguage(path: string): string | undefined {
+	const lower = path.toLowerCase();
+	if (/\.(?:js|jsx|mjs|cjs|ts|tsx|mts|cts)$/.test(lower)) return "jsts";
+	if (/\.json(?:c|5)?$/.test(lower)) return "json";
+	return undefined;
+}
+
+function piLensEventPaths(data: unknown): string[] {
+	if (!data || typeof data !== "object") return [];
+	const record = data as Record<string, unknown>;
+	const paths: string[] = [];
+	if (typeof record.filePath === "string") paths.push(record.filePath);
+	if (typeof record.file_path === "string") paths.push(record.file_path);
+	if (typeof record.path === "string") paths.push(record.path);
+	for (const key of ["paths", "files", "changedFiles"]) {
+		const values = record[key];
+		if (!Array.isArray(values)) continue;
+		for (const value of values) {
+			if (typeof value === "string") paths.push(value);
+			else if (value && typeof value === "object" && typeof (value as Record<string, unknown>).path === "string") {
+				paths.push((value as Record<string, unknown>).path as string);
+			}
+		}
+	}
+	return paths;
+}
+
+function rememberPiLensEvent(data: unknown): void {
+	for (const path of piLensEventPaths(data)) {
+		piLensState.currentFile = path;
+		const language = piLensLanguage(path);
+		if (language) piLensState.languages.add(language);
+	}
+}
+
 function truncateTo(target: string | undefined, maxLen: number): string {
 	if (!target) return "—";
 	return truncateToWidth(target, maxLen);
+}
+
+function marqueeToWidth(target: string, maxWidth: number, offset: number): string {
+	if (visibleWidth(target) <= maxWidth) return target;
+	const loop = `${target}   `;
+	const period = visibleWidth(loop);
+	return sliceByColumn(loop + loop, offset % period, maxWidth, true);
 }
 
 /* ──────────────────────────────────────────────────────── live state ── */
@@ -521,7 +568,9 @@ class SidepanelPanel implements Component {
 	) {
 		this.timer = setInterval(() => {
 			this.frame++;
-			if (animating() || this.frame % 8 === 0) this.tui.requestRender();
+			const cwd = displayPath(liveCtx?.cwd);
+			const cwdNeedsScroll = visibleWidth(cwd) > PANEL_WIDTH - 13;
+			if (animating() || cwdNeedsScroll || this.frame % 8 === 0) this.tui.requestRender();
 		}, 125);
 	}
 
@@ -633,8 +682,27 @@ class SidepanelPanel implements Component {
 
 	private locationRows(inner: number): string[] {
 		const out = [this.sep(inner, "LOCATION")];
-		out.push(this.field("DIRECTORY", truncateTo(displayPath(liveCtx?.cwd), inner - 11), inner, "text"));
+		const cwdWidth = Math.max(1, inner - 11);
+		out.push(this.field("CWD", marqueeToWidth(displayPath(liveCtx?.cwd), cwdWidth, this.frame), inner, "text"));
 		out.push(this.field("BRANCH", truncateTo(footerDataRef?.getGitBranch?.() ?? undefined, inner - 11), inner, "muted"));
+		return out;
+	}
+
+	private piLensRows(inner: number): string[] {
+		const values: string[] = [];
+		for (const [key, value] of footerDataRef?.getExtensionStatuses?.() ?? []) {
+			if (key.startsWith("pi-lens") && value) values.push(value);
+		}
+		const languages = [...piLensState.languages].sort((a, b) => a.localeCompare(b)).join(" ");
+		if (!values.length && !languages && !piLensState.currentFile) return [];
+
+		const out = [this.sep(inner, "PI-LENS")];
+		if (languages) out.push(this.field("LANG", languages, inner, "muted"));
+		if (piLensState.currentFile) {
+			const fileWidth = Math.max(1, inner - 11);
+			out.push(this.field("FILE", marqueeToWidth(displayPath(piLensState.currentFile), fileWidth, this.frame), inner, "text"));
+		}
+		out.push(...values.map((value) => this.frameLine(` ${value}`, inner)));
 		return out;
 	}
 
@@ -779,11 +847,11 @@ class SidepanelPanel implements Component {
 				at: now,
 				inner,
 				compact: c,
-				lines: [...this.locationRows(inner), ...this.sessionRows(inner, c), ...this.telemetryRows(inner, c), ...this.performanceRows(inner, c), ...this.swapRows(inner, c)],
+				lines: [...this.sessionRows(inner, c), ...this.telemetryRows(inner, c), ...this.performanceRows(inner, c), ...this.swapRows(inner, c)],
 			};
 		}
 		const bottom = this.theme.fg("border", "└" + "─".repeat(inner) + "┘");
-		const lines = [...this.statusSection(inner), ...this.cache.lines];
+		const lines = [...this.statusSection(inner), ...this.locationRows(inner), ...this.cache.lines, ...this.piLensRows(inner)];
 		const target = (this.fillHeight?.() ?? 0) - 1;
 		while (lines.length < target) lines.push(this.frameLine("", inner));
 		return [...lines, bottom].map((l) => truncateToWidth(l, width));
@@ -975,11 +1043,13 @@ export default async function (pi: ExtensionAPI) {
 		if (ctx.mode !== "tui") return;
 		if (!panelEnabled) {
 			hidePanel();
+			ctx.ui.setWidget("pi-lens", undefined);
 			ctx.ui.setWidget("sidepanel-hook", undefined);
 			ctx.ui.setHeader(undefined);
-			ctx.ui.setFooter(undefined);
+			ctx.ui.setFooter(() => ({ render: () => [], invalidate: () => {} }));
 			return;
 		}
+		ctx.ui.setWidget("pi-lens", undefined);
 		ctx.ui.setWidget("sidepanel-hook", (tui: TUI, theme: Theme) => {
 			tuiRef = tui;
 			queueMicrotask(() => showPanel(theme));
@@ -1016,9 +1086,26 @@ export default async function (pi: ExtensionAPI) {
 	let titleTimer: ReturnType<typeof setInterval> | undefined;
 	let liveTimer: ReturnType<typeof setInterval> | undefined;
 	const runningTools = new Map<string, { name: string; target: string }>();
+	const onPiLensEvent = (data: unknown) => {
+		rememberPiLensEvent(data);
+		repaint();
+	};
+	for (const channel of [
+		"pilens:files:touched",
+		"pilens:format:start",
+		"pilens:format:done",
+		"pilens:autofix:start",
+		"pilens:diagnostics",
+		"pi-lens/analysis-complete",
+		"pi-lens/findings",
+	]) {
+		pi.events.on(channel, onPiLensEvent);
+	}
 
 	pi.on("session_start", async (_event: SessionStartEvent, ctx: ExtensionContext) => {
 		liveCtx = ctx;
+		piLensState.currentFile = "";
+		piLensState.languages.clear();
 		recountSession(ctx);
 		pi.getCommands().some((c: { name: string }) => {
 			if (c.name?.replace(/^\/?/, "") === "smart-compact") {
@@ -1142,6 +1229,7 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("tool_execution_start", async (event: ToolExecutionStartEvent, ctx: ExtensionContext) => {
 		liveCtx = ctx;
 		const tool = { name: event.toolName ?? "", target: toolTarget(event.args) };
+		if (/edit|write|patch/i.test(tool.name)) rememberPiLensEvent(event.args);
 		runningTools.set(event.toolCallId, tool);
 		setPhase("tool");
 		state.toolName = tool.name;
@@ -1232,9 +1320,10 @@ export default async function (pi: ExtensionAPI) {
 					applyChrome(ctx);
 				} else {
 					hidePanel();
+					ctx.ui.setWidget("pi-lens", undefined);
 					ctx.ui.setWidget("sidepanel-hook", undefined);
 					ctx.ui.setHeader(undefined);
-					ctx.ui.setFooter(undefined);
+					ctx.ui.setFooter(() => ({ render: () => [], invalidate: () => {} }));
 				}
 				ctx.ui.notify(`Side panel ${panelEnabled ? "enabled" : "disabled"}`, "info");
 				return;
@@ -1322,9 +1411,10 @@ export default async function (pi: ExtensionAPI) {
 			if (arg === "off") {
 				panelEnabled = false;
 				hidePanel();
+				ctx.ui.setWidget("pi-lens", undefined);
 				ctx.ui.setWidget("sidepanel-hook", undefined);
 				ctx.ui.setHeader(undefined);
-				ctx.ui.setFooter(undefined);
+				ctx.ui.setFooter(() => ({ render: () => [], invalidate: () => {} }));
 				ctx.ui.notify("Sidepanel chrome disabled", "info");
 				return;
 			}
