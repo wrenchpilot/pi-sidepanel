@@ -1183,7 +1183,7 @@ class SidepanelPanel implements Component {
       ),
     );
 
-    // TOOLS: Success (mercy) = succeeded, FAILED (severity) = failed
+    // TOOLS
     out.push(
       this.frameLine(
         ` ${th.fg("dim", "TOOLS".padEnd(9))}${th.fg("success", `✓${state.toolOk}`)}${th.fg("dim", " Success ")}${th.fg(state.toolFail ? "error" : "dim", `✗${state.toolFail}`)}${th.fg("dim", " FAILED")}`,
@@ -1191,7 +1191,7 @@ class SidepanelPanel implements Component {
       ),
     );
 
-    // WINDOW: the context window, one seal per seventh
+    // WINDOW: the context window
     const usage = contextUsage();
     const percent = usage?.percent ?? 0;
     const liveMark = usage?.live
