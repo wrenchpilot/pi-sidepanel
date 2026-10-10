@@ -1186,7 +1186,7 @@ class SidepanelPanel implements Component {
     // TOOLS
     out.push(
       this.frameLine(
-        ` ${th.fg("dim", "TOOLS".padEnd(9))}${th.fg("success", `✓${state.toolOk}`)}${th.fg("dim", " Success ")}${th.fg(state.toolFail ? "error" : "dim", `✗${state.toolFail}`)}${th.fg("dim", " FAILED")}`,
+        ` ${th.fg("dim", "TOOLS".padEnd(9))}${th.fg("success", `✓${state.toolOk}`)}${th.fg("dim", " Success ")}${th.fg(state.toolFail ? "error" : "dim", `✗${state.toolFail}`)}${th.fg("dim", " Failed")}`,
         inner,
       ),
     );
