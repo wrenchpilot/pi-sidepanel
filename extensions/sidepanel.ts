@@ -44,6 +44,7 @@ import {
   sliceByColumn,
   truncateToWidth,
   visibleWidth,
+  wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 
 /* ──────────────────────────────────────────────────────── constants ── */
@@ -1009,13 +1010,9 @@ class SidepanelPanel implements Component {
       const cwd = displayPath(liveCtx?.cwd);
       const cwdNeedsScroll =
         visibleWidth(cwd) > panelWidth - 13;
-      const piLensNeedsScroll = piLensStatusValues().some(
-        (value) => visibleWidth(value) > panelWidth - 3,
-      );
       if (
         animating() ||
         cwdNeedsScroll ||
-        piLensNeedsScroll ||
         this.frame % 8 === 0
       )
         this.tui.requestRender();
@@ -1194,6 +1191,43 @@ class SidepanelPanel implements Component {
         "muted",
       ),
     );
+    return out;
+  }
+
+  private extensionRows(inner: number): string[] {
+    const statuses = extensionStatusEntries().filter(
+      ([key]) => !key.toLowerCase().startsWith("pi-lens"),
+    );
+    if (!statuses.length) return [];
+    const out = [this.sep(inner, "EXTENSIONS")];
+    for (const [key, value] of statuses) {
+      const label = key.toUpperCase();
+      const labelWidth = Math.min(
+        visibleWidth(label),
+        Math.max(1, inner - 4),
+      );
+      const labelText =
+        visibleWidth(label) > labelWidth
+          ? truncateToWidth(label, labelWidth, "…")
+          : label;
+      const valueWidth = Math.max(
+        1,
+        inner - labelWidth - 2,
+      );
+      // Match the leading space and separator used on the first line.
+      const continuation = " ".repeat(labelWidth + 2);
+      const wrapped = wrapTextWithAnsi(value, valueWidth);
+      for (const [index, line] of wrapped.entries()) {
+        out.push(
+          this.frameLine(
+            index === 0
+              ? ` ${this.theme.fg("dim", labelText)} ${line}`
+              : `${continuation}${line}`,
+            inner,
+          ),
+        );
+      }
+    }
     return out;
   }
 
@@ -1594,6 +1628,7 @@ class SidepanelPanel implements Component {
       ...this.statusSection(inner),
       ...this.locationRows(inner),
       ...this.cache.lines,
+      ...this.extensionRows(inner),
       ...this.piLensRows(inner),
     ];
     const target = (this.fillHeight?.() ?? 0) - 1;
@@ -1670,16 +1705,25 @@ let panelWidth = PANEL_WIDTH;
 let liveCtx: ExtensionContext | undefined;
 let footerDataRef: ReadonlyFooterDataProvider | undefined;
 
-function piLensStatusValues(): string[] {
-  const values: string[] = [];
-  for (const [
-    key,
-    value,
-  ] of footerDataRef?.getExtensionStatuses?.() ?? []) {
-    if (key.startsWith("pi-lens") && value)
-      values.push(value);
+function extensionStatusEntries(): Array<[string, string]> {
+  const entries: Array<[string, string]> = [];
+  for (const [key, value] of
+    footerDataRef?.getExtensionStatuses?.() ?? []) {
+    const text = value
+      .replace(/[\r\n\t]/g, " ")
+      .replace(/ +/g, " ")
+      .trim();
+    if (text) entries.push([key, text]);
   }
-  return values;
+  return entries.sort(([a], [b]) => a.localeCompare(b));
+}
+
+function piLensStatusValues(): string[] {
+  return extensionStatusEntries().flatMap(([key, value]) =>
+    key.toLowerCase().startsWith("pi-lens")
+      ? [value]
+      : [],
+  );
 }
 
 let tuiRef: TUI | undefined;
@@ -1899,6 +1943,7 @@ export default async function (pi: ExtensionAPI) {
     ctx.ui.setWidget("sidepanel-hook", undefined);
     ctx.ui.setHeader(undefined);
     ctx.ui.setFooter(undefined);
+    footerDataRef = undefined;
   };
 
   const applyChrome = (ctx: ExtensionContext) => {
@@ -1931,11 +1976,9 @@ export default async function (pi: ExtensionAPI) {
         return {
           render: () => [],
           invalidate: () => {},
-          dispose: () => {
-            unsubscribeBranch();
-            if (footerDataRef === footerData)
-              footerDataRef = undefined;
-          },
+          // Keep the provider reference even if another extension replaces
+          // this footer; it remains the shared source for extension statuses.
+          dispose: unsubscribeBranch,
         };
       },
     );

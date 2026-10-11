@@ -1,6 +1,6 @@
 # Pi Side Panel
 
-A Pi TUI extension that replaces the default footer and Pi-Lens widget with a right-hand side panel for session, model, token, performance, Git, and local inference status.
+A Pi TUI extension that replaces the default footer and Pi-Lens widget with a right-hand side panel for session, model, token, performance, Git, extension status, and local inference information.
 
 This extension was extracted and adapted from the side panel in [b-iurea/pi-magi-theme](https://github.com/b-iurea/pi-magi-theme).
 
@@ -39,8 +39,9 @@ The package contains the TypeScript source; Pi loads it directly and supplies it
 - **TELEMETRY** — turns, token totals, cache reads, API cost, tool success rate, context-window usage, and hygiene counters.
 - **PERFORMANCE** — generation speed, prompt speed, KV-cache hit rate, TTFT, duration, and uptime.
 - **LLAMA-SWAP / NINFER** — model health, VRAM/GPU/RAM metrics, throughput, energy, and cost when the active provider supports them.
+- **EXTENSIONS** — status text published by any extension through `ctx.ui.setStatus()`. Long values marquee-scroll.
 
-The extension hides the normal Pi footer and the Pi-Lens `belowEditor` widget so this information is presented in the side panel instead. `/sidepanel off` restores Pi's built-in header and footer for the rest of the session.
+The extension replaces the normal Pi footer and hides the Pi-Lens `belowEditor` widget so this information is presented in the side panel. Status text from other extensions is mirrored in the `EXTENSIONS` section. `/sidepanel off` restores Pi's built-in header and footer for the rest of the session.
 
 ## Commands
 
