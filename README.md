@@ -6,20 +6,25 @@ This extension was extracted and adapted from the side panel in [b-iurea/pi-magi
 
 ## Install
 
-Run directly while developing:
+Install the published Pi package for persistent use:
+
+```bash
+pi install npm:pi-sidepanel
+```
+
+To try it for one invocation without adding it to Pi's settings:
+
+```bash
+pi -e npm:pi-sidepanel
+```
+
+For local development, load the extension source directly:
 
 ```bash
 pi --extension ./extensions/sidepanel.ts
 ```
 
-For persistent use, copy or symlink `extensions/sidepanel.ts` into Pi's user extensions directory:
-
-```bash
-mkdir -p ~/.pi/agent/extensions
-ln -s "$PWD/extensions/sidepanel.ts" ~/.pi/agent/extensions/sidepanel.ts
-```
-
-The panel is available in TUI mode. Non-interactive modes continue to work without rendering terminal UI.
+The package contains the TypeScript source; Pi loads it directly and supplies its Pi runtime dependencies. The panel is available in TUI mode. Non-interactive modes continue to work without rendering terminal UI.
 
 ## Panel sections
 
@@ -76,6 +81,22 @@ Example:
 
 ## Requirements
 
-- Pi with TUI extension support
-- Node.js APIs available to extensions
+- Pi 1.1.0 or newer with TUI extension support
+- Node.js 22.19 or newer
 - Optional: Pi-Lens, llama-swap, or NInfer for their additional panel sections
+
+## Development
+
+Install the development dependencies and run the checks before packing:
+
+```bash
+npm install
+npm run check
+npm run pack:check
+```
+
+There is no separate build step. The published package intentionally contains `extensions/sidepanel.ts`, because Pi's package loader evaluates TypeScript extensions directly.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -1,0 +1,52 @@
+{
+  "name": "pi-sidepanel",
+  "version": "0.1.0",
+  "description": "A Pi TUI extension that displays session, model, token, performance, Git, and local inference status in a side panel.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "terminal-ui",
+    "tui"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/wrenchpilot/pi-sidepanel#readme",
+    "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wrenchpilot/pi-sidepanel.git"
+  },
+    "bugs": {
+    "url": "https://github.com/wrenchpilot/pi-sidepanel/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "pi": {
+    "image": "https://raw.githubusercontent.com/wrenchpilot/pi-sidepanel/master/screenshots/pi-sidepanel.png",
+    "extensions": [
+      "./extensions/sidepanel.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "pack:check": "npm pack --dry-run",
+    "prepack": "npm run check",
+    "prepublishOnly": "npm run check"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
