@@ -2,6 +2,8 @@
 
 A Pi TUI extension that replaces the default footer and Pi-Lens widget with a right-hand side panel for session, model, token, performance, Git, and local inference status.
 
+This extension was extracted and adapted from the side panel in [b-iurea/pi-magi-theme](https://github.com/b-iurea/pi-magi-theme).
+
 ## Install
 
 Run directly while developing:
@@ -29,7 +31,7 @@ The panel is available in TUI mode. Non-interactive modes continue to work witho
 - **PERFORMANCE** — generation speed, prompt speed, KV-cache hit rate, TTFT, duration, and uptime.
 - **LLAMA-SWAP / NINFER** — model health, VRAM/GPU/RAM metrics, throughput, energy, and cost when the active provider supports them.
 
-The extension hides the normal Pi footer and the Pi-Lens `belowEditor` widget so this information is presented in the side panel instead.
+The extension hides the normal Pi footer and the Pi-Lens `belowEditor` widget so this information is presented in the side panel instead. `/sidepanel off` restores Pi's built-in header and footer for the rest of the session.
 
 ## Commands
 
@@ -60,8 +62,8 @@ Example:
   "ui": {
     "compact": false,
     "panelWidth": 42,
-    "kwhPrice": 0.30,
-    "currency": "EUR"
+    "kwhPrice": 0.18,
+    "currency": "USD"
   },
   "ninfer": {
     "urls": ["http://127.0.0.1:8000"],

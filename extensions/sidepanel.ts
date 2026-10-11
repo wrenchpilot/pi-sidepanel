@@ -47,7 +47,6 @@ const PANEL_WIDTH = 34;
 const MIN_PANEL_WIDTH = 28;
 const MAX_PANEL_WIDTH = 72;
 const FAIL_FLASH_MS = 2500;
-const REBIRTH_MS = 6000;
 const ONLINE_MS = 3000;
 const LIVE_POLL_MS = 500;
 const LIVE_STALE_MS = 2000;
@@ -103,29 +102,6 @@ function bar(
     theme.fg(tone, "▓".repeat(f)) +
     theme.fg("dim", "░".repeat(total - f))
   );
-}
-
-function renderSeals(
-  theme: Theme,
-  percent: number,
-  now = Date.now(),
-): string {
-  const broken = Math.min(
-    7,
-    Math.floor((percent / 100) * 7),
-  );
-  const tone = usageTone(percent);
-  let out = "";
-  for (let i = 0; i < 7; i++) {
-    if (i >= broken) out += theme.fg("dim", "○");
-    else if (broken === 6 && i === 5)
-      out += theme.fg(
-        Math.floor(now / 500) % 2 ? "warning" : "error",
-        "◉",
-      );
-    else out += theme.fg(tone, "◉");
-  }
-  return out;
 }
 
 const piLensState = {
@@ -240,19 +216,7 @@ const state = {
   compacting: false,
   compactSince: 0,
   compactBy: "",
-  rebornAt: 0,
   hasSmartCompact: false,
-  lastCouncil: undefined as
-    | {
-        verdict:
-          | "APPROVE"
-          | "CONDITIONAL"
-          | "REJECT"
-          | null;
-        tally: number;
-        question: string;
-      }
-    | undefined,
   pruned: 0,
   thinkCuts: 0,
   lastFailAt: 0,
@@ -279,7 +243,6 @@ function animating(now = Date.now()): boolean {
     (swap.state === "ready" &&
       now - swap.since < ONLINE_MS) ||
     state.compacting ||
-    now - state.rebornAt < REBIRTH_MS ||
     now - state.lastFailAt < FAIL_FLASH_MS
   );
 }
@@ -361,7 +324,6 @@ function recountSession(ctx: ExtensionContext): void {
     cacheRead: 0,
     cost: 0,
   });
-  state.lastCouncil = undefined;
   state.thinkCuts = 0;
   for (const entry of ctx.sessionManager.getBranch()) {
     if (
@@ -401,7 +363,6 @@ const swap = {
   since: 0,
   loadMs: 0,
   expectedLoadMs: LOAD_DEFAULT_MS,
-  infection: 0,
   error: "",
   gpus: [] as GpuStat[],
   ramUsed: 0,
@@ -815,16 +776,12 @@ async function preloadModel(
     const loaded = swap.state === "loading";
     if (loaded) {
       swap.loadMs = Date.now() - started;
-      swap.infection = Math.min(
-        1,
-        swap.loadMs / swap.expectedLoadMs,
-      );
       const cfg = loadSidepanelConfig();
       saveSidepanelConfig({
         ...cfg,
         loads: { ...cfg.loads, [realId]: swap.loadMs },
       });
-    } else swap.infection = 0;
+    }
     setSwapState("ready");
   } catch (err) {
     if (swap.modelId === id)
@@ -956,7 +913,7 @@ class SidepanelPanel implements Component {
 
     if (state.phase === "tool" || (idle && fallen)) {
       title = fallen
-        ? `BERSERK · ${state.lastFailTool}`
+        ? `FAILED · ${state.lastFailTool}`
         : `${state.toolName || "tool"} · ${secsSince(state.phaseSince, now)}s`;
       titleTone = fallen ? "error" : "warning";
       const target =
@@ -1005,11 +962,7 @@ class SidepanelPanel implements Component {
     } else if (state.compacting) {
       title = `COMPACTING · ${state.compactBy || "context"} · ${secsSince(state.compactSince, now)}s`;
       titleTone = "warning";
-      status = `${pulse} breaking the seals`;
-    } else if (now - state.rebornAt < REBIRTH_MS) {
-      title = "REBORN";
-      titleTone = "success";
-      status = `${pulse} context compacted`;
+      status = `${pulse} compacting context`;
     } else {
       title = "STANDBY";
       titleTone = "muted";
@@ -1209,7 +1162,7 @@ class SidepanelPanel implements Component {
     }
     out.push(
       this.frameLine(
-        ` ${th.fg("dim", "WINDOW".padEnd(9))}${renderSeals(th, percent)} ${th.fg(usageTone(percent), `${percent.toFixed(0)}%`)}${liveMark}`,
+        ` ${th.fg("dim", "WINDOW".padEnd(9))}${bar(th, Math.round(percent / 10), 10, usageTone(percent))} ${th.fg(usageTone(percent), `${percent.toFixed(0)}%`)}${liveMark}`,
         inner,
       ),
     );
@@ -1727,17 +1680,19 @@ export default async function (pi: ExtensionAPI) {
     sidepanelCfg.ui?.currency === "USD" ? "USD" : "EUR";
   swap.diskWh = sidepanelCfg.totalWh ?? 0;
 
+  const disableChrome = (ctx: ExtensionContext) => {
+    if (ctx.mode !== "tui") return;
+    hidePanel();
+    ctx.ui.setWidget("pi-lens", undefined);
+    ctx.ui.setWidget("sidepanel-hook", undefined);
+    ctx.ui.setHeader(undefined);
+    ctx.ui.setFooter(undefined);
+  };
+
   const applyChrome = (ctx: ExtensionContext) => {
     if (ctx.mode !== "tui") return;
     if (!panelEnabled) {
-      hidePanel();
-      ctx.ui.setWidget("pi-lens", undefined);
-      ctx.ui.setWidget("sidepanel-hook", undefined);
-      ctx.ui.setHeader(undefined);
-      ctx.ui.setFooter(() => ({
-        render: () => [],
-        invalidate: () => {},
-      }));
+      disableChrome(ctx);
       return;
     }
     ctx.ui.setWidget("pi-lens", undefined);
@@ -1749,22 +1704,8 @@ export default async function (pi: ExtensionAPI) {
         return { render: () => [], invalidate: () => {} };
       },
     );
-    ctx.ui.setHeader((_tui: TUI, theme: Theme) => {
-      const dim = (s: string) => theme.fg("dim", s);
-      const lines = [
-        "",
-        theme.fg("accent", "◆ Side Panel"),
-        dim(
-          " lightweight stats overlay · no council · no /magi",
-        ),
-        "",
-      ].map((l) => l.padEnd(40));
-      return {
-        render: (width: number) =>
-          lines.map((line) => truncateToWidth(line, width)),
-        invalidate: () => {},
-      };
-    });
+    // Keep Pi's normal header; the side panel is the only custom chrome.
+    ctx.ui.setHeader(undefined);
     ctx.ui.setFooter(
       (
         _tui: TUI,
@@ -2080,7 +2021,6 @@ export default async function (pi: ExtensionAPI) {
     "session_compact",
     async (event: SessionCompactEvent) => {
       state.compacting = false;
-      state.rebornAt = Date.now();
       if (event.fromExtension) {
         state.compactBy = state.hasSmartCompact
           ? "smart-compact"
@@ -2134,14 +2074,7 @@ export default async function (pi: ExtensionAPI) {
         if (panelEnabled) {
           applyChrome(ctx);
         } else {
-          hidePanel();
-          ctx.ui.setWidget("pi-lens", undefined);
-          ctx.ui.setWidget("sidepanel-hook", undefined);
-          ctx.ui.setHeader(undefined);
-          ctx.ui.setFooter(() => ({
-            render: () => [],
-            invalidate: () => {},
-          }));
+          disableChrome(ctx);
         }
         ctx.ui.notify(
           `Side panel ${panelEnabled ? "enabled" : "disabled"}`,
@@ -2403,14 +2336,7 @@ export default async function (pi: ExtensionAPI) {
       }
       if (arg === "off") {
         panelEnabled = false;
-        hidePanel();
-        ctx.ui.setWidget("pi-lens", undefined);
-        ctx.ui.setWidget("sidepanel-hook", undefined);
-        ctx.ui.setHeader(undefined);
-        ctx.ui.setFooter(() => ({
-          render: () => [],
-          invalidate: () => {},
-        }));
+        disableChrome(ctx);
         ctx.ui.notify("Sidepanel chrome disabled", "info");
         return;
       }
