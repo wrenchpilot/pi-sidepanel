@@ -4,6 +4,10 @@ A Pi TUI extension that replaces the default footer and Pi-Lens widget with a ri
 
 This extension was extracted and adapted from the side panel in [b-iurea/pi-magi-theme](https://github.com/b-iurea/pi-magi-theme).
 
+## Screenshot
+
+![Pi Side Panel screenshot](screenshot/pi-sidepanel.png)
+
 ## Install
 
 Install the published Pi package for persistent use:
