@@ -40,6 +40,7 @@ import type {
   TUI,
 } from "@earendil-works/pi-tui";
 import {
+  Container,
   HStack,
   truncateToWidth,
   visibleWidth,
@@ -2643,7 +2644,87 @@ let tuiRef: TUI | undefined;
 let panelHandle: ReturnType<TUI["showOverlay"]> | undefined;
 let panel: SidepanelPanel | undefined;
 let wrappedRoot: Component | undefined;
+let regularChildren: Component[] | undefined;
+let regularRoot: Component | undefined;
+let restoreSelectionClamp: (() => void) | undefined;
+let selectionSection: "left" | "panel" | undefined;
 let titleDone = false;
+
+interface SelectionPointLike {
+  col?: number;
+  scrollView?: unknown;
+}
+
+interface SelectionBoundsLike {
+  start: SelectionPointLike;
+  end: SelectionPointLike;
+}
+
+interface SelectionColumnsLike {
+  start: number;
+  end: number;
+}
+
+type SelectionColumnsFn = (
+  ...args: [
+    line: string,
+    row: number,
+    selection: SelectionBoundsLike,
+    minColumn?: number,
+    maxColumn?: number,
+  ]
+) => SelectionColumnsLike;
+
+function clampPromptSelection(tui: TUI): void {
+  // SAFETY: fullscreen TUI exposes this runtime selection method, but its
+  // private implementation is intentionally absent from the public type.
+  const target = tui as unknown as {
+    getSelectionColumns?: SelectionColumnsFn;
+  };
+  if (!target.getSelectionColumns || restoreSelectionClamp)
+    return;
+  const original = target.getSelectionColumns.bind(tui);
+  target.getSelectionColumns = (...args) => {
+    const [line, row, selection, minColumn, maxColumn] =
+      args;
+    const columns = original(
+      line,
+      row,
+      selection,
+      minColumn,
+      maxColumn,
+    );
+    if (
+      selection.start.scrollView ||
+      selection.end.scrollView ||
+      tui.terminal.columns < panelWidth + 56
+    )
+      return columns;
+    const boundary = Math.max(
+      0,
+      tui.terminal.columns - panelWidth - 1,
+    );
+    const section =
+      selectionSection ??
+      ((selection.start.col ?? 0) >= boundary
+        ? "panel"
+        : "left");
+    if (section === "panel") {
+      return {
+        start: Math.max(columns.start, boundary),
+        end: Math.max(columns.end, boundary),
+      };
+    }
+    return {
+      start: Math.min(columns.start, boundary),
+      end: Math.min(columns.end, boundary),
+    };
+  };
+  restoreSelectionClamp = () => {
+    target.getSelectionColumns = original;
+    restoreSelectionClamp = undefined;
+  };
+}
 
 function windowTitle(cwd: string, done = false): string {
   return `${done ? "✓ " : ""}π - Sidepanel - ${displayPath(cwd)}`;
@@ -2652,6 +2733,7 @@ function windowTitle(cwd: string, done = false): string {
 const showPanel = (theme: Theme) => {
   if (!tuiRef || panel || !panelEnabled) return;
   panel = createSidepanelPanel(tuiRef, theme);
+  clampPromptSelection(tuiRef);
 
   // SAFETY: tuiRef is a TUI instance; we access private layoutRoot/setLayoutRoot for fullscreen mode
   const t = tuiRef as unknown as {
@@ -2691,6 +2773,38 @@ const showPanel = (theme: Theme) => {
     return;
   }
 
+  if (t.mode === "regular") {
+    const originalChildren = [...tuiRef.children];
+    const left = new Container();
+    for (const child of originalChildren)
+      left.addChild(child);
+    regularChildren = originalChildren;
+    regularRoot = new HStack(
+      [
+        {
+          component: left,
+          basis: 0,
+          grow: 1,
+          shrink: 1,
+          minSize: 40,
+        },
+        {
+          component: panel,
+          basis: panelWidth,
+          grow: 0,
+          shrink: 0,
+          visible: (vp: { width: number }) =>
+            vp.width >= panelWidth + 56,
+        },
+      ],
+      { gap: 1 },
+    );
+    panel.fillHeight = () => tuiRef?.terminal.rows ?? 0;
+    tuiRef.children = [regularRoot];
+    tuiRef.requestRender();
+    return;
+  }
+
   panelHandle = tuiRef.showOverlay(panel, {
     nonCapturing: true,
     anchor: "top-right",
@@ -2703,6 +2817,12 @@ const showPanel = (theme: Theme) => {
 };
 
 const hidePanel = () => {
+  restoreSelectionClamp?.();
+  if (regularChildren && tuiRef) {
+    tuiRef.children = regularChildren;
+    regularChildren = undefined;
+    regularRoot = undefined;
+  }
   if (wrappedRoot && tuiRef) {
     // SAFETY: wrappedRoot is only set after the fullscreen TUI exposes setLayoutRoot.
     const t = tuiRef as unknown as {
@@ -2721,6 +2841,19 @@ const repaint = () => {
   panel?.invalidate();
   tuiRef?.requestRender();
 };
+
+function rememberSelectionSection(data: string): void {
+  const match = data.match(
+    /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/,
+  );
+  if (!match || match[4] !== "M" || !tuiRef) return;
+  const button = Number(match[1]);
+  if ((button & 3) !== 0 || (button & 32) !== 0) return;
+  const column = Number(match[2]);
+  const boundary = tuiRef.terminal.columns - panelWidth - 1;
+  selectionSection =
+    column >= boundary ? "panel" : "left";
+}
 
 let panelEnabled = true;
 interface NInferModelRecord {
@@ -3454,7 +3587,8 @@ export default async function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
   ): void => {
     unsubscribeInput?.();
-    unsubscribeInput = ctx.ui.onTerminalInput(() => {
+    unsubscribeInput = ctx.ui.onTerminalInput((data: string) => {
+      rememberSelectionSection(data);
       if (titleDone) {
         titleDone = false;
         ctx.ui.setTitle(windowTitle(ctx.cwd));
