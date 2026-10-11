@@ -2,7 +2,12 @@
  * Side Panel — a lightweight stats panel for the pi TUI.
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -73,7 +78,7 @@ function fmtMs(ms: number): string {
 const secsSince = (t: number, now = Date.now()) =>
   Math.max(0, Math.floor((now - t) / 1000));
 
-const sessionStart = Date.now();
+let sessionStart = Date.now();
 
 function usageTone(
   percent: number,
@@ -197,6 +202,14 @@ function clampPanelWidth(width: number): number {
     MAX_PANEL_WIDTH,
     Math.max(MIN_PANEL_WIDTH, Math.round(width)),
   );
+}
+
+function nonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === "number" &&
+    Number.isFinite(value) &&
+    value >= 0
+    ? value
+    : undefined;
 }
 
 /* ──────────────────────────────────────────────────────── live state ── */
@@ -380,6 +393,18 @@ const swap = {
 
 let swapConnectionVersion = 0;
 
+function isCurrentSwap(
+  version: number,
+  modelId: string,
+  base: string,
+): boolean {
+  return (
+    version === swapConnectionVersion &&
+    swap.modelId === modelId &&
+    swap.base === base
+  );
+}
+
 function setSwapState(s: SwapState, error = ""): void {
   swap.state = s;
   swap.since = Date.now();
@@ -417,6 +442,13 @@ function normalizeServiceBase(url: string): string {
 
 function parseSwapMetrics(text: string): void {
   const gpus = new Map<string, GpuStat>();
+  let ramUsed = 0;
+  let ramTotal = 0;
+  let srvTps = 0;
+  let srvPps = 0;
+  let cacheTokens = 0;
+  let promptTokens = 0;
+
   for (const line of text.split("\n")) {
     const m =
       /^(?:llamaswap|ninfer)_([a-z_]+)(?:\{([^}]*)\})?\s+(\S+)$/.exec(
@@ -425,22 +457,19 @@ function parseSwapMetrics(text: string): void {
     if (!m) continue;
     const key = m[1];
     if (!key) continue;
-    const labels = m[2] ?? "";
     const value = Number(m[3]);
-    if (key === "memory_used_bytes") swap.ramUsed = value;
-    else if (key === "memory_total_bytes")
-      swap.ramTotal = value;
-    else if (key === "last_tokens_per_second" && value > 0)
-      swap.srvTps = value;
-    else if (key === "last_prompt_per_second" && value > 0)
-      swap.srvPps = value;
+    if (!Number.isFinite(value)) continue;
+    const labels = m[2] ?? "";
+    if (key === "memory_used_bytes") ramUsed = value;
+    else if (key === "memory_total_bytes") ramTotal = value;
+    else if (key === "last_tokens_per_second")
+      srvTps = Math.max(0, value);
+    else if (key === "last_prompt_per_second")
+      srvPps = Math.max(0, value);
     else if (key === "last_cache_tokens")
-      swap.cacheTokens = value;
+      cacheTokens = Math.max(0, value);
     else if (key === "last_prompt_tokens")
-      swap.inputTokens = Math.max(
-        0,
-        value - swap.cacheTokens,
-      );
+      promptTokens = Math.max(0, value);
     if (!key.startsWith("gpu_")) continue;
     const id = /id="([^"]*)"/.exec(labels)?.[1] ?? "0";
     const gpu = gpus.get(id) ?? {
@@ -462,6 +491,14 @@ function parseSwapMetrics(text: string): void {
       gpu.power = value;
     gpus.set(id, gpu);
   }
+
+  // Replace the snapshot instead of retaining metrics that disappeared.
+  swap.ramUsed = ramUsed;
+  swap.ramTotal = ramTotal;
+  swap.srvTps = srvTps;
+  swap.srvPps = srvPps;
+  swap.cacheTokens = cacheTokens;
+  swap.inputTokens = Math.max(0, promptTokens - cacheTokens);
   swap.gpus = [...gpus.entries()]
     .sort(([a], [b]) => Number(a) - Number(b))
     .map(([, g]) => g);
@@ -469,15 +506,18 @@ function parseSwapMetrics(text: string): void {
 
 function sampleEnergy(now = Date.now()): void {
   const watts = swap.gpus.reduce(
-    (sum, g) => sum + g.power,
+    (sum, g) => sum + Math.max(0, g.power),
     0,
   );
   if (swap.lastSampleAt) {
     const dtH =
-      Math.min(60000, now - swap.lastSampleAt) / 3600000;
+      Math.max(0, Math.min(60000, now - swap.lastSampleAt)) /
+      3600000;
     swap.energyWh += ((swap.lastWatts + watts) / 2) * dtH;
   }
   swap.lastSampleAt = now;
+  // Keep the previous sample for the trapezoidal integration above.
+  swap.lastWatts = watts;
   persistEnergy();
 }
 
@@ -488,16 +528,17 @@ function totalWh(): number {
 const ENERGY_SAVE_MS = 60000;
 let lastPersistAt = 0;
 
-function persistEnergy(): void {
+function persistEnergy(force = false): void {
   const delta = swap.energyWh - swap.savedWh;
   if (
     delta <= 0 ||
-    Date.now() - lastPersistAt < ENERGY_SAVE_MS
+    (!force && Date.now() - lastPersistAt < ENERGY_SAVE_MS)
   )
     return;
   lastPersistAt = Date.now();
   const cfg = loadSidepanelConfig();
-  cfg.totalWh = (cfg.totalWh ?? 0) + delta;
+  cfg.totalWh =
+    (nonNegativeNumber(cfg.totalWh) ?? 0) + delta;
   try {
     saveSidepanelConfig(cfg);
   } catch {
@@ -508,11 +549,17 @@ function persistEnergy(): void {
 }
 
 async function refreshSwapMetrics(): Promise<void> {
-  if (!swap.base) return;
+  const version = swapConnectionVersion;
+  const modelId = swap.modelId;
+  const base = swap.base;
+  const headers = { ...swap.headers };
+  if (!base) return;
   try {
-    parseSwapMetrics(
-      await (await swapGet("/metrics")).text(),
-    );
+    const response = await swapFetch(base, headers, "/metrics");
+    if (!response.ok) return;
+    const text = await response.text();
+    if (!isCurrentSwap(version, modelId, base)) return;
+    parseSwapMetrics(text);
     sampleEnergy();
   } catch {
     // server unreachable: keep the last values
@@ -522,13 +569,19 @@ async function refreshSwapMetrics(): Promise<void> {
 async function refreshSwapRunning(): Promise<void> {
   if (swap.kind === "ninfer") return refreshNinferHealth();
   if (!swap.base || swap.state !== "ready") return;
+  const version = swapConnectionVersion;
+  const modelId = swap.modelId;
+  const base = swap.base;
+  const realId = swap.realId;
+  const headers = { ...swap.headers };
   try {
-    const { running } = (await (
-      await swapGet("/running")
-    ).json()) as { running?: { model: string }[] };
-    if (
-      !(running ?? []).some((r) => r.model === swap.realId)
-    )
+    const response = await swapFetch(base, headers, "/running");
+    if (!response.ok) return;
+    const { running } = (await response.json()) as {
+      running?: { model: string }[];
+    };
+    if (!isCurrentSwap(version, modelId, base)) return;
+    if (!(running ?? []).some((r) => r.model === realId))
       setSwapState("asleep");
   } catch {
     // optional
@@ -536,33 +589,54 @@ async function refreshSwapRunning(): Promise<void> {
 }
 
 async function refreshNinferHealth(): Promise<void> {
+  const version = swapConnectionVersion;
+  const modelId = swap.modelId;
+  const base = swap.base;
+  const headers = { ...swap.headers };
+  if (!base) return;
   try {
-    const res = await swapGet("/health", 3000);
+    const res = await swapFetch(
+      base,
+      headers,
+      "/health",
+      3000,
+    );
+    if (!isCurrentSwap(version, modelId, base)) return;
     if (res.ok) {
       if (swap.state !== "ready") setSwapState("ready");
     } else
       setSwapState("error", `health HTTP ${res.status}`);
   } catch (err) {
-    setSwapState(
-      "error",
-      err instanceof Error ? err.message : String(err),
-    );
+    if (isCurrentSwap(version, modelId, base))
+      setSwapState(
+        "error",
+        err instanceof Error ? err.message : String(err),
+      );
   }
 }
 
 async function refreshSwapActivity(): Promise<void> {
   if (swap.kind === "ninfer") return refreshSwapMetrics();
-  if (!swap.base) return;
+  const version = swapConnectionVersion;
+  const modelId = swap.modelId;
+  const base = swap.base;
+  const headers = { ...swap.headers };
+  if (!base) return;
   try {
-    const { data } = (await (
-      await swapGet("/api/metrics/activity?limit=1")
-    ).json()) as { data?: any[] };
+    const response = await swapFetch(
+      base,
+      headers,
+      "/api/metrics/activity?limit=1",
+    );
+    if (!response.ok) return;
+    const { data } = (await response.json()) as {
+      data?: Array<{ tokens?: ActivityTokens }>;
+    };
+    if (!isCurrentSwap(version, modelId, base)) return;
     const t = data?.[0]?.tokens;
     if (!t) return;
-    if (t.tokens_per_second > 0)
-      swap.srvTps = t.tokens_per_second;
-    if (t.prompt_per_second > 0)
-      swap.srvPps = t.prompt_per_second;
+    swap.srvTps = Math.max(0, t.tokens_per_second ?? 0);
+    swap.srvPps = Math.max(0, t.prompt_per_second ?? 0);
     swap.cacheTokens = Math.max(0, t.cache_tokens ?? 0);
     swap.inputTokens = Math.max(0, t.input_tokens ?? 0);
   } catch {
@@ -572,20 +646,88 @@ async function refreshSwapActivity(): Promise<void> {
 
 /* ── live context ── */
 
+interface SwapSlot {
+  is_processing?: boolean;
+  n_prompt_tokens?: number;
+}
+
 const live = { tokens: 0, at: 0 };
+
+function resetSwapObservation(): void {
+  swap.gpus = [];
+  swap.ramUsed = 0;
+  swap.ramTotal = 0;
+  swap.srvTps = 0;
+  swap.srvPps = 0;
+  swap.cacheTokens = 0;
+  swap.inputTokens = 0;
+  swap.loadMs = 0;
+  swap.lastSampleAt = 0;
+  swap.lastWatts = 0;
+  live.tokens = 0;
+  live.at = 0;
+}
+
+function resetSessionState(): void {
+  sessionStart = Date.now();
+  swapConnectionVersion++;
+  resetSwapObservation();
+  Object.assign(state, {
+    phase: "idle" as Phase,
+    phaseSince: sessionStart,
+    toolName: "",
+    toolTarget: "",
+    turns: 0,
+    toolOk: 0,
+    toolFail: 0,
+    runStart: 0,
+    lastRunMs: 0,
+    compacting: false,
+    compactSince: 0,
+    compactBy: "",
+    hasSmartCompact: false,
+    pruned: 0,
+    thinkCuts: 0,
+    lastFailAt: 0,
+    lastFailTool: "",
+    lastFailTarget: "",
+  });
+  Object.assign(perf, {
+    start: 0,
+    first: 0,
+    chars: 0,
+    tps: 0,
+    ttft: 0,
+    lastMs: 0,
+    peakTps: 0,
+  });
+}
 
 async function refreshLiveContext(): Promise<void> {
   if (swap.kind !== "llama-swap" || swap.state !== "ready")
     return;
+  const version = swapConnectionVersion;
+  const modelId = swap.modelId;
+  const base = swap.base;
+  const realId = swap.realId;
+  const headers = { ...swap.headers };
+  if (!base) return;
   try {
-    const slots = (await (
-      await swapGet(
-        `/upstream/${encodeURIComponent(swap.realId)}/slots`,
-        1500,
-      )
-    ).json()) as any[];
+    const response = await swapFetch(
+      base,
+      headers,
+      `/upstream/${encodeURIComponent(realId)}/slots`,
+      1500,
+    );
+    if (!response.ok) return;
+    const slots = (await response.json()) as SwapSlot[];
+    if (!isCurrentSwap(version, modelId, base)) return;
     const busy = slots.filter(
-      (s) => s.is_processing && s.n_prompt_tokens > 0,
+      (slot): slot is Required<SwapSlot> =>
+        slot.is_processing === true &&
+        typeof slot.n_prompt_tokens === "number" &&
+        Number.isFinite(slot.n_prompt_tokens) &&
+        slot.n_prompt_tokens > 0,
     );
     if (!busy.length) return;
     live.tokens = Math.max(
@@ -636,6 +778,9 @@ async function connectSwap(
   ctx: ExtensionContext,
   model: Model<Api> | undefined,
 ): Promise<boolean> {
+  const previousBase = swap.base;
+  const previousKind = swap.kind;
+  const previousModelId = swap.modelId;
   const version = ++swapConnectionVersion;
   if (
     !model ||
@@ -643,7 +788,9 @@ async function connectSwap(
       model.provider !== "ninfer") ||
     !model.baseUrl
   ) {
+    resetSwapObservation();
     swap.base = "";
+    swap.headers = {};
     swap.kind = "";
     swap.modelId = "";
     swap.realId = "";
@@ -654,10 +801,22 @@ async function connectSwap(
   const id = model.id;
   swap.modelId = id;
   swap.realId = id;
+  // Invalidate readers while credentials for the new connection are resolved.
+  swap.base = "";
+  swap.headers = {};
   setSwapState("checking");
-  const auth =
-    await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (version !== swapConnectionVersion) return false;
+  const auth = await ctx.modelRegistry
+    .getApiKeyAndHeaders(model)
+    .catch((err: unknown) => {
+      if (version === swapConnectionVersion)
+        setSwapState(
+          "error",
+          err instanceof Error ? err.message : String(err),
+        );
+      return undefined;
+    });
+  if (!auth || version !== swapConnectionVersion)
+    return false;
   const base = normalizeServiceBase(model.baseUrl);
   const headers = {
     ...((auth.ok ? auth.headers : undefined) as
@@ -667,6 +826,12 @@ async function connectSwap(
       ? { Authorization: `Bearer ${auth.apiKey}` }
       : {}),
   };
+  if (
+    previousBase !== base ||
+    previousKind !== model.provider ||
+    previousModelId !== id
+  )
+    resetSwapObservation();
   swap.base = base;
   swap.headers = headers;
   void refreshSwapMetrics();
@@ -685,21 +850,34 @@ async function connectSwap(
   return true;
 }
 
+interface SwapModelInfo {
+  id?: string;
+  meta?: {
+    llamaswap?: {
+      type?: string;
+      modelID?: string;
+    };
+  };
+}
+
 async function swapAliases(
   get: (path: string) => Promise<Response> = swapGet,
 ): Promise<Map<string, string>> {
   const aliases = new Map<string, string>();
   try {
-    const { data } = (await (
-      await get("/v1/models")
-    ).json()) as { data?: any[] };
-    for (const m of data ?? []) {
-      const ls = m.meta?.llamaswap;
+    const response = await get("/v1/models");
+    if (!response.ok) return aliases;
+    const { data } = (await response.json()) as {
+      data?: SwapModelInfo[];
+    };
+    for (const model of data ?? []) {
+      if (!model.id) continue;
+      const alias = model.meta?.llamaswap;
       aliases.set(
-        m.id,
-        ls?.type === "alias" && ls.modelID
-          ? ls.modelID
-          : m.id,
+        model.id,
+        alias?.type === "alias" && alias.modelID
+          ? alias.modelID
+          : model.id,
       );
     }
   } catch {
@@ -712,9 +890,9 @@ async function swapRunning(
   get: (path: string) => Promise<Response> = swapGet,
 ): Promise<Map<string, string>> {
   try {
-    const { running } = (await (
-      await get("/running")
-    ).json()) as {
+    const response = await get("/running");
+    if (!response.ok) return new Map();
+    const { running } = (await response.json()) as {
       running?: { model: string; state: string }[];
     };
     return new Map(
@@ -731,17 +909,19 @@ async function probeModel(
 ): Promise<void> {
   if (!(await connectSwap(ctx, model)) || !model) return;
   if (swap.kind === "ninfer") return refreshNinferHealth();
+  const version = swapConnectionVersion;
   const id = model.id;
   const realId = swap.realId;
   const base = swap.base;
   const headers = { ...swap.headers };
-  const state = (
-    await swapRunning((path) =>
-      swapFetch(base, headers, path),
-    )
-  ).get(realId);
-  if (swap.modelId === id)
-    setSwapState(state === "ready" ? "ready" : "asleep");
+  const running = await swapRunning((path) =>
+    swapFetch(base, headers, path),
+  );
+  const runningState = running.get(realId);
+  if (isCurrentSwap(version, id, base))
+    setSwapState(
+      runningState === "ready" ? "ready" : "asleep",
+    );
 }
 
 async function preloadModel(
@@ -750,19 +930,23 @@ async function preloadModel(
 ): Promise<void> {
   if (!(await connectSwap(ctx, model)) || !model) return;
   if (swap.kind === "ninfer") return refreshNinferHealth();
+  const version = swapConnectionVersion;
   const id = model.id;
-  if (swap.modelId !== id) return;
   const base = swap.base;
   const headers = { ...swap.headers };
   const realId = swap.realId;
+  if (!isCurrentSwap(version, id, base)) return;
   swap.expectedLoadMs =
-    loadSidepanelConfig().loads?.[realId] ??
+    nonNegativeNumber(loadSidepanelConfig().loads?.[realId]) ??
     LOAD_DEFAULT_MS;
 
   const slow = setTimeout(() => {
-    if (swap.modelId === id && swap.state === "checking")
+    if (
+      isCurrentSwap(version, id, base) &&
+      swap.state === "checking"
+    )
       setSwapState("loading");
-  }, 400);
+  }, Math.min(400, Math.max(100, Math.round(swap.expectedLoadMs / 4))));
   const started = Date.now();
   try {
     const res = await swapFetch(
@@ -771,27 +955,32 @@ async function preloadModel(
       `/upstream/${encodeURIComponent(id)}/health`,
       15 * 60000,
     );
-    if (swap.modelId !== id) return;
+    if (!isCurrentSwap(version, id, base)) return;
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const loaded = swap.state === "loading";
     if (loaded) {
       swap.loadMs = Date.now() - started;
       const cfg = loadSidepanelConfig();
-      saveSidepanelConfig({
-        ...cfg,
-        loads: { ...cfg.loads, [realId]: swap.loadMs },
-      });
+      try {
+        saveSidepanelConfig({
+          ...cfg,
+          loads: { ...cfg.loads, [realId]: swap.loadMs },
+        });
+      } catch {
+        // A read-only config must not make a healthy model look offline.
+      }
     }
     setSwapState("ready");
   } catch (err) {
-    if (swap.modelId === id)
+    if (isCurrentSwap(version, id, base))
       setSwapState(
         "error",
         err instanceof Error ? err.message : String(err),
       );
   } finally {
     clearTimeout(slow);
-    void refreshSwapMetrics();
+    if (isCurrentSwap(version, id, base))
+      void refreshSwapMetrics();
   }
 }
 
@@ -930,6 +1119,10 @@ class SidepanelPanel implements Component {
       title = `RESPONDING${tps ? ` · ${tps.toFixed(1)} tok/s` : ""}`;
       titleTone = "success";
       status = `${pulse} streaming`;
+    } else if (state.compacting) {
+      title = `COMPACTING · ${state.compactBy || "context"} · ${secsSince(state.compactSince, now)}s`;
+      titleTone = "warning";
+      status = `${pulse} compacting context`;
     } else if (
       idle &&
       (swap.state === "checking" ||
@@ -959,10 +1152,6 @@ class SidepanelPanel implements Component {
         : "ONLINE";
       titleTone = "success";
       status = `${pulse} model ready`;
-    } else if (state.compacting) {
-      title = `COMPACTING · ${state.compactBy || "context"} · ${secsSince(state.compactSince, now)}s`;
-      titleTone = "warning";
-      status = `${pulse} compacting context`;
     } else {
       title = "STANDBY";
       titleTone = "muted";
@@ -1439,19 +1628,31 @@ const SIDE_PANEL_CONFIG_PATH = join(
 
 function loadSidepanelConfig(): SidepanelConfig {
   try {
-    return JSON.parse(
+    const parsed: unknown = JSON.parse(
       readFileSync(SIDE_PANEL_CONFIG_PATH, "utf8"),
     );
+    return parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed)
+      ? (parsed as SidepanelConfig)
+      : {};
   } catch {
     return {};
   }
 }
 
 function saveSidepanelConfig(cfg: SidepanelConfig): void {
+  mkdirSync(join(homedir(), ".pi", "agent"), {
+    recursive: true,
+    mode: 0o700,
+  });
   writeFileSync(
     SIDE_PANEL_CONFIG_PATH,
     JSON.stringify(cfg, null, 2) + "\n",
+    { encoding: "utf8", mode: 0o600 },
   );
+  // mode is ignored when the file already exists.
+  chmodSync(SIDE_PANEL_CONFIG_PATH, 0o600);
 }
 
 /* ── panel UI preferences ── */
@@ -1598,20 +1799,28 @@ async function discoverNinfer(
   pi: ExtensionAPI,
   cfg: SidepanelConfig["ninfer"],
 ): Promise<void> {
-  if (!cfg?.urls?.length) return;
-  const headers: Record<string, string> = cfg.apiKey
-    ? { Authorization: `Bearer ${cfg.apiKey}` }
+  const urls = (Array.isArray(cfg?.urls) ? cfg.urls : []).filter(
+    (url): url is string =>
+      typeof url === "string" && url.trim().length > 0,
+  );
+  if (!urls.length) return;
+  const apiKey =
+    typeof cfg?.apiKey === "string" ? cfg.apiKey : "";
+  const headers: Record<string, string> = apiKey
+    ? { Authorization: `Bearer ${apiKey}` }
     : {};
   const lists = await Promise.all(
-    cfg.urls.map(async (url) => {
+    urls.map(async (url) => {
       const baseUrl = normalizeServiceBase(url) + "/v1";
       try {
-        const { data } = (await (
-          await fetch(`${baseUrl}/models`, {
-            headers,
-            signal: AbortSignal.timeout(3000),
-          })
-        ).json()) as { data?: NInferModelRecord[] };
+        const response = await fetch(`${baseUrl}/models`, {
+          headers,
+          signal: AbortSignal.timeout(3000),
+        });
+        if (!response.ok) return [];
+        const { data } = (await response.json()) as {
+          data?: NInferModelRecord[];
+        };
         return (data ?? []).flatMap(
           (m): ProviderModelConfig[] => {
             if (m.owned_by !== "ninfer" || !m.id) return [];
@@ -1662,7 +1871,7 @@ async function discoverNinfer(
   pi.registerProvider("ninfer", {
     api: "openai-completions",
     baseUrl,
-    apiKey: cfg.apiKey || "ninfer",
+    apiKey: apiKey || "ninfer",
     models,
   });
 }
@@ -1671,14 +1880,17 @@ export default async function (pi: ExtensionAPI) {
   const sidepanelCfg = loadSidepanelConfig();
   await discoverNinfer(pi, sidepanelCfg.ninfer);
 
-  ui.compact = sidepanelCfg.ui?.compact ?? false;
-  ui.kwhPrice = sidepanelCfg.ui?.kwhPrice;
+  ui.compact = sidepanelCfg.ui?.compact === true;
+  ui.kwhPrice = nonNegativeNumber(
+    sidepanelCfg.ui?.kwhPrice,
+  );
   panelWidth = clampPanelWidth(
-    sidepanelCfg.ui?.panelWidth ?? PANEL_WIDTH,
+    nonNegativeNumber(sidepanelCfg.ui?.panelWidth) ??
+      PANEL_WIDTH,
   );
   ui.currency =
     sidepanelCfg.ui?.currency === "USD" ? "USD" : "EUR";
-  swap.diskWh = sidepanelCfg.totalWh ?? 0;
+  swap.diskWh = nonNegativeNumber(sidepanelCfg.totalWh) ?? 0;
 
   const disableChrome = (ctx: ExtensionContext) => {
     if (ctx.mode !== "tui") return;
@@ -1765,6 +1977,10 @@ export default async function (pi: ExtensionAPI) {
       _event: SessionStartEvent,
       ctx: ExtensionContext,
     ) => {
+      resetSessionState();
+      panelEnabled = true;
+      titleDone = false;
+      runningTools.clear();
       liveCtx = ctx;
       piLensState.currentFile = "";
       piLensState.languages.clear();
@@ -1780,10 +1996,12 @@ export default async function (pi: ExtensionAPI) {
       });
       if (ctx.mode !== "tui") return;
       applyChrome(ctx);
-      void probeModel(ctx).then(
-        () => void refreshSwapRunning(),
-      );
-      metricsTimer ??= setInterval(() => {
+      void probeModel(ctx)
+        .then(() => repaint())
+        .catch(() => undefined);
+      clearInterval(metricsTimer);
+      lastPoll = 0;
+      metricsTimer = setInterval(() => {
         const now = Date.now();
         if (
           !animating(now) &&
@@ -1795,11 +2013,13 @@ export default async function (pi: ExtensionAPI) {
           .then(refreshSwapRunning)
           .then(repaint);
       }, BUSY_POLL_MS);
-      liveTimer ??= setInterval(() => {
+      clearInterval(liveTimer);
+      liveTimer = setInterval(() => {
         if (state.phase !== "idle")
           void refreshLiveContext().then(repaint);
       }, LIVE_POLL_MS);
-      unsubscribeInput ??= ctx.ui.onTerminalInput(() => {
+      unsubscribeInput?.();
+      unsubscribeInput = ctx.ui.onTerminalInput(() => {
         if (titleDone) {
           titleDone = false;
           ctx.ui.setTitle(windowTitle(ctx.cwd));
@@ -1808,9 +2028,13 @@ export default async function (pi: ExtensionAPI) {
           void preloadModel(liveCtx);
         return undefined;
       });
-      titleTimer ??= setInterval(() => {
-        if (panelEnabled)
-          ctx.ui.setTitle(windowTitle(ctx.cwd, titleDone));
+      clearInterval(titleTimer);
+      titleTimer = setInterval(() => {
+        const current = liveCtx;
+        if (panelEnabled && current?.mode === "tui")
+          current.ui.setTitle(
+            windowTitle(current.cwd, titleDone),
+          );
       }, TITLE_REFRESH_MS);
     },
   );
@@ -1835,12 +2059,14 @@ export default async function (pi: ExtensionAPI) {
     ) => {
       liveCtx = ctx;
       if (ctx.mode === "tui")
-        void preloadModel(ctx, event.model);
+        void preloadModel(ctx, event.model).catch(
+          () => undefined,
+        );
     },
   );
 
   pi.on("session_shutdown", async () => {
-    persistEnergy();
+    persistEnergy(true);
     clearInterval(metricsTimer);
     metricsTimer = undefined;
     unsubscribeInput?.();
@@ -1906,7 +2132,7 @@ export default async function (pi: ExtensionAPI) {
           state.toolTarget = toolTarget(call.arguments);
         }
       }
-      if ("delta" in e && e.delta) {
+      if (e && "delta" in e && e.delta) {
         if (!perf.first) perf.first = Date.now();
         perf.chars += e.delta.length;
       }
@@ -2135,12 +2361,13 @@ export default async function (pi: ExtensionAPI) {
         }
         let report: ActivityReport;
         try {
-          report = (await (
-            await swapGet(
-              `/api/metrics/activity?limit=${ACTIVITY_REPORT_ROWS}`,
-              15000,
-            )
-          ).json()) as typeof report;
+          const response = await swapGet(
+            `/api/metrics/activity?limit=${ACTIVITY_REPORT_ROWS}`,
+            15000,
+          );
+          if (!response.ok)
+            throw new Error(`HTTP ${response.status}`);
+          report = (await response.json()) as typeof report;
         } catch (err) {
           ctx.ui.notify(
             `llama-swap status failed: ${err instanceof Error ? err.message : String(err)}`,
