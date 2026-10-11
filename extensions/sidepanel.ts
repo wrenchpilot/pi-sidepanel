@@ -1097,6 +1097,7 @@ interface SwapSlot {
   n_prompt_tokens?: number;
   n_prompt_tokens_processed?: number;
   n_prompt_tokens_cache?: number;
+  progress?: number;
   timings?: SwapSlotTimings;
 }
 
@@ -1110,6 +1111,7 @@ const live = {
   promptTotal: 0,
   promptProcessed: 0,
   promptProgressKnown: false,
+  promptTotalEstimated: false,
 };
 
 function resetSwapObservation(): void {
@@ -1136,6 +1138,7 @@ function resetSwapObservation(): void {
   live.promptTotal = 0;
   live.promptProcessed = 0;
   live.promptProgressKnown = false;
+  live.promptTotalEstimated = false;
 }
 
 function resetSessionState(): void {
@@ -1217,18 +1220,26 @@ async function refreshLiveContext(): Promise<void> {
       progressOf(slot) > progressOf(best) ? slot : best,
     );
     const promptTokens = progressOf(activeSlot);
-    const promptTotal =
-      typeof activeSlot.n_prompt_tokens === "number"
-        ? activeSlot.n_prompt_tokens
-        : promptTokens;
-    const promptProgressKnown =
-      typeof activeSlot.n_prompt_tokens_processed === "number";
-    live.promptTotal = promptTotal;
-    live.promptProcessed = Math.min(
-      promptTotal,
-      promptTokens,
-    );
-    live.promptProgressKnown = promptProgressKnown;
+    const reportedProgress =
+      typeof activeSlot.progress === "number" &&
+      Number.isFinite(activeSlot.progress) &&
+      activeSlot.progress > 0 &&
+      activeSlot.progress <= 1
+        ? activeSlot.progress
+        : undefined;
+    const contextTokens = liveCtx?.getContextUsage?.()?.tokens;
+    const estimatedTotal =
+      reportedProgress !== undefined
+        ? Math.ceil(promptTokens / reportedProgress)
+        : typeof contextTokens === "number" &&
+            contextTokens > promptTokens
+          ? contextTokens
+          : 0;
+    live.promptTotal = estimatedTotal;
+    live.promptProcessed = promptTokens;
+    live.promptProgressKnown = estimatedTotal > 0;
+    live.promptTotalEstimated =
+      reportedProgress === undefined && estimatedTotal > 0;
     if (
       typeof activeSlot.n_prompt_tokens === "number" &&
       typeof activeSlot.n_prompt_tokens_cache === "number"
@@ -2119,27 +2130,39 @@ class SidepanelPanel implements Component {
         "muted",
       ),
     );
-    if (
-      active &&
-      live.promptProgressKnown &&
-      live.promptTotal > 0
-    ) {
-      const progress = Math.min(
-        1,
-        Math.max(
-          0,
-          live.promptProcessed / live.promptTotal,
-        ),
-      );
-      const percent = Math.round(progress * 100);
-      out.push(
-        this.field(
-          "PROGRESS",
-          `${bar(th, Math.round(progress * 10), 10, "accent")} ${percent}% ${fmtTokens(live.promptProcessed)}/${fmtTokens(live.promptTotal)}`,
-          inner,
-          "muted",
-        ),
-      );
+    if (active && live.promptProcessed > 0) {
+      if (
+        live.promptProgressKnown &&
+        live.promptTotal > 0
+      ) {
+        const progress = Math.min(
+          1,
+          Math.max(
+            0,
+            live.promptProcessed / live.promptTotal,
+          ),
+        );
+        const percent = Math.round(progress * 100);
+        const estimateMark =
+          live.promptTotalEstimated ? "~" : "";
+        out.push(
+          this.field(
+            "PROGRESS",
+            `${bar(th, Math.round(progress * 10), 10, "accent")} ${estimateMark}${percent}% ${fmtTokens(live.promptProcessed)}/${fmtTokens(live.promptTotal)}`,
+            inner,
+            "muted",
+          ),
+        );
+      } else {
+        out.push(
+          this.field(
+            "PROGRESS",
+            `${fmtTokens(live.promptProcessed)} processed`,
+            inner,
+            "muted",
+          ),
+        );
+      }
     }
     if (compact) return out;
     const promptTotal = swap.cacheTokens + swap.inputTokens;
@@ -2873,6 +2896,7 @@ export default async function (pi: ExtensionAPI) {
       live.promptTotal = 0;
       live.promptProcessed = 0;
       live.promptProgressKnown = false;
+      live.promptTotalEstimated = false;
     },
   );
 
