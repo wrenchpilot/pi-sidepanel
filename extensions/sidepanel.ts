@@ -58,6 +58,7 @@ const LIVE_POLL_MS = 500;
 const LIVE_STALE_MS = 2000;
 const BUSY_POLL_MS = 3000;
 const IDLE_POLL_MS = 30000;
+const SERVER_RATE_STALE_MS = 120000;
 const TITLE_REFRESH_MS = 2000;
 const LOAD_DEFAULT_MS = 60000;
 const ACTIVITY_REPORT_ROWS = 100;
@@ -110,10 +111,21 @@ function bar(
   );
 }
 
+interface PiLensFindingCounts {
+  errors: number;
+  warnings: number;
+  info: number;
+}
+
 const piLensState = {
   currentFile: "",
   languages: new Set<string>(),
+  files: new Map<string, PiLensFindingCounts>(),
 };
+
+function emptyPiLensCounts(): PiLensFindingCounts {
+  return { errors: 0, warnings: 0, info: 0 };
+}
 
 function displayPath(target: string | undefined): string {
   if (!target) return "—";
@@ -165,11 +177,159 @@ function piLensEventPaths(data: unknown): string[] {
   return paths;
 }
 
+function piLensFindingPath(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of ["filePath", "file_path", "path", "file"]) {
+    if (typeof record[key] === "string")
+      return record[key] as string;
+  }
+  return undefined;
+}
+
+function piLensFindingSeverity(
+  value: unknown,
+  fallback: "error" | "warning" | "info",
+): keyof PiLensFindingCounts {
+  if (!value || typeof value !== "object")
+    return fallback === "error"
+      ? "errors"
+      : fallback === "warning"
+        ? "warnings"
+        : "info";
+  const record = value as Record<string, unknown>;
+  const raw = [
+    record.severity,
+    record.level,
+    record.semantic,
+    record.kind,
+    record.type,
+  ].find((candidate) => typeof candidate === "string");
+  const text = typeof raw === "string" ? raw.toLowerCase() : "";
+  if (text.includes("error") || text.includes("block"))
+    return "errors";
+  if (text.includes("warn")) return "warnings";
+  if (text.includes("info") || text.includes("hint"))
+    return "info";
+  return fallback === "error"
+    ? "errors"
+    : fallback === "warning"
+      ? "warnings"
+      : "info";
+}
+
 function rememberPiLensEvent(data: unknown): void {
-  for (const path of piLensEventPaths(data)) {
+  const paths = piLensEventPaths(data);
+  for (const path of paths) {
     piLensState.currentFile = path;
     const language = piLensLanguage(path);
     if (language) piLensState.languages.add(language);
+  }
+  if (!data || typeof data !== "object") return;
+  const record = data as Record<string, unknown>;
+  const primaryPath =
+    typeof record.filePath === "string"
+      ? record.filePath
+      : paths[0];
+  const grouped = new Map<string, PiLensFindingCounts>();
+
+  const addFinding = (
+    finding: unknown,
+    fallback: "error" | "warning" | "info",
+    fallbackPath = primaryPath,
+  ): void => {
+    const path = piLensFindingPath(finding) ?? fallbackPath;
+    if (!path) return;
+    const counts = grouped.get(path) ?? emptyPiLensCounts();
+    counts[piLensFindingSeverity(finding, fallback)]++;
+    grouped.set(path, counts);
+    piLensState.currentFile = path;
+    const language = piLensLanguage(path);
+    if (language) piLensState.languages.add(language);
+  };
+
+  const fileEntries = Array.isArray(record.files)
+    ? record.files
+    : [];
+  for (const value of fileEntries) {
+    if (!value || typeof value !== "object") continue;
+    const entry = value as Record<string, unknown>;
+    const path = piLensFindingPath(entry);
+    if (!path) continue;
+    const diagnostics = Array.isArray(entry.diagnostics)
+      ? entry.diagnostics
+      : [];
+    if (!diagnostics.length) {
+      grouped.set(path, emptyPiLensCounts());
+      continue;
+    }
+    for (const finding of diagnostics)
+      addFinding(finding, "info", path);
+  }
+
+  const diagnostics = Array.isArray(record.diagnostics)
+    ? record.diagnostics
+    : undefined;
+  const findings = Array.isArray(record.findings)
+    ? record.findings
+    : undefined;
+  if (diagnostics?.length) {
+    for (const finding of diagnostics)
+      addFinding(finding, "info");
+  } else if (findings?.length) {
+    for (const finding of findings)
+      addFinding(finding, "info");
+  } else {
+    const blockers = Array.isArray(record.blockers)
+      ? record.blockers
+      : [];
+    const warnings = Array.isArray(record.warnings)
+      ? record.warnings
+      : [];
+    for (const finding of blockers)
+      addFinding(finding, "error");
+    for (const finding of warnings)
+      addFinding(finding, "warning");
+  }
+
+  const explicitErrors =
+    typeof record.errorCount === "number"
+      ? record.errorCount
+      : typeof record.errors === "number"
+        ? record.errors
+        : undefined;
+  const explicitWarnings =
+    typeof record.warningCount === "number"
+      ? record.warningCount
+      : typeof record.warnings === "number"
+        ? record.warnings
+        : undefined;
+  if (
+    !grouped.size &&
+    primaryPath &&
+    (explicitErrors !== undefined ||
+      explicitWarnings !== undefined)
+  ) {
+    grouped.set(primaryPath, {
+      errors: Math.max(0, explicitErrors ?? 0),
+      warnings: Math.max(0, explicitWarnings ?? 0),
+      info: 0,
+    });
+  }
+
+  const hasSnapshot =
+    fileEntries.length > 0 ||
+    diagnostics !== undefined ||
+    findings !== undefined ||
+    Array.isArray(record.blockers) ||
+    Array.isArray(record.warnings);
+  if (!grouped.size && hasSnapshot && primaryPath)
+    grouped.set(primaryPath, emptyPiLensCounts());
+
+  for (const [path, counts] of grouped) {
+    if (counts.errors || counts.warnings || counts.info)
+      piLensState.files.set(path, counts);
+    else piLensState.files.delete(path);
   }
 }
 
@@ -290,11 +450,15 @@ function toolTarget(args: unknown): string {
 
 /* ── performance ── */
 
+const MIN_PROMPT_SAMPLE_MS = 250;
+const MAX_ESTIMATED_PROMPT_PPS = 1_000_000;
+
 const perf = {
   start: 0,
   first: 0,
   chars: 0,
   tps: 0,
+  pps: 0,
   ttft: 0,
   lastMs: 0,
   peakTps: 0,
@@ -382,7 +546,9 @@ const swap = {
   ramUsed: 0,
   ramTotal: 0,
   srvTps: 0,
+  srvTpsAt: 0,
   srvPps: 0,
+  srvPpsAt: 0,
   cacheTokens: 0,
   inputTokens: 0,
   energyWh: 0,
@@ -461,15 +627,34 @@ function parseSwapMetrics(text: string): void {
     const value = Number(m[3]);
     if (!Number.isFinite(value)) continue;
     const labels = m[2] ?? "";
+    const metricModel = /(?:model|model_id|model_name)="([^"]*)"/.exec(
+      labels,
+    )?.[1];
+    const metricMatchesModel =
+      !metricModel ||
+      metricModel === swap.realId ||
+      metricModel === swap.modelId;
     if (key === "memory_used_bytes") ramUsed = value;
     else if (key === "memory_total_bytes") ramTotal = value;
-    else if (key === "last_tokens_per_second")
+    else if (
+      key === "last_tokens_per_second" &&
+      metricMatchesModel
+    )
       srvTps = Math.max(0, value);
-    else if (key === "last_prompt_per_second")
+    else if (
+      key === "last_prompt_per_second" &&
+      metricMatchesModel
+    )
       srvPps = Math.max(0, value);
-    else if (key === "last_cache_tokens")
+    else if (
+      key === "last_cache_tokens" &&
+      metricMatchesModel
+    )
       cacheTokens = Math.max(0, value);
-    else if (key === "last_prompt_tokens")
+    else if (
+      key === "last_prompt_tokens" &&
+      metricMatchesModel
+    )
       promptTokens = Math.max(0, value);
     if (!key.startsWith("gpu_")) continue;
     const id = /id="([^"]*)"/.exec(labels)?.[1] ?? "0";
@@ -493,11 +678,18 @@ function parseSwapMetrics(text: string): void {
     gpus.set(id, gpu);
   }
 
-  // Replace the snapshot instead of retaining metrics that disappeared.
+  // Replace instantaneous metrics, but retain the last valid throughput
+  // measurement when the server reports zero or omits it between requests.
   swap.ramUsed = ramUsed;
   swap.ramTotal = ramTotal;
-  swap.srvTps = srvTps;
-  swap.srvPps = srvPps;
+  if (srvTps > 0) {
+    swap.srvTps = srvTps;
+    swap.srvTpsAt = Date.now();
+  }
+  if (srvPps > 0) {
+    swap.srvPps = srvPps;
+    swap.srvPpsAt = Date.now();
+  }
   swap.cacheTokens = cacheTokens;
   swap.inputTokens = Math.max(0, promptTokens - cacheTokens);
   swap.gpus = [...gpus.entries()]
@@ -620,6 +812,7 @@ async function refreshSwapActivity(): Promise<void> {
   if (swap.kind === "ninfer") return refreshSwapMetrics();
   const version = swapConnectionVersion;
   const modelId = swap.modelId;
+  const realId = swap.realId;
   const base = swap.base;
   const headers = { ...swap.headers };
   if (!base) return;
@@ -627,19 +820,54 @@ async function refreshSwapActivity(): Promise<void> {
     const response = await swapFetch(
       base,
       headers,
-      "/api/metrics/activity?limit=1",
+      "/api/metrics/activity?limit=10",
     );
     if (!response.ok) return;
     const { data } = (await response.json()) as {
-      data?: Array<{ tokens?: ActivityTokens }>;
+      data?: ActivityRow[];
     };
-    if (!isCurrentSwap(version, modelId, base)) return;
-    const t = data?.[0]?.tokens;
-    if (!t) return;
-    swap.srvTps = Math.max(0, t.tokens_per_second ?? 0);
-    swap.srvPps = Math.max(0, t.prompt_per_second ?? 0);
-    swap.cacheTokens = Math.max(0, t.cache_tokens ?? 0);
-    swap.inputTokens = Math.max(0, t.input_tokens ?? 0);
+    if (
+      !isCurrentSwap(version, modelId, base) ||
+      swap.realId !== realId
+    )
+      return;
+
+    const rows = data ?? [];
+    const matchingRows = rows.filter(
+      (row) =>
+        row.model === realId || row.model === modelId,
+    );
+    let selectedRows = matchingRows;
+    if (
+      !selectedRows.length &&
+      rows.length === 1 &&
+      !rows[0]?.model
+    )
+      selectedRows = rows;
+    if (!selectedRows.length) return;
+
+    // Activity is used only for the latest request's cache counters. The
+    // Prometheus /metrics endpoint is authoritative for server throughput;
+    // averaging historical activity rows makes PROMPT/S and TOK/S wrong.
+    const timestampOf = (row: ActivityRow): number => {
+      const timestamp = row.timestamp
+        ? Date.parse(row.timestamp)
+        : Number.NaN;
+      return Number.isFinite(timestamp) ? timestamp : 0;
+    };
+    const latestRow = [...selectedRows].sort(
+      (a, b) => timestampOf(b) - timestampOf(a),
+    )[0];
+    const latest = latestRow?.tokens;
+    if (!latest) return;
+    swap.cacheTokens = Math.max(
+      0,
+      latest.cache_tokens ?? 0,
+    );
+    swap.inputTokens = Math.max(
+      0,
+      latest.input_tokens ?? 0,
+    );
   } catch {
     // metrics are optional
   }
@@ -659,7 +887,9 @@ function resetSwapObservation(): void {
   swap.ramUsed = 0;
   swap.ramTotal = 0;
   swap.srvTps = 0;
+  swap.srvTpsAt = 0;
   swap.srvPps = 0;
+  swap.srvPpsAt = 0;
   swap.cacheTokens = 0;
   swap.inputTokens = 0;
   swap.loadMs = 0;
@@ -698,6 +928,7 @@ function resetSessionState(): void {
     first: 0,
     chars: 0,
     tps: 0,
+    pps: 0,
     ttft: 0,
     lastMs: 0,
     peakTps: 0,
@@ -848,6 +1079,7 @@ async function connectSwap(
   )
     return false;
   swap.realId = aliases.get(id) ?? id;
+  void refreshSwapActivity();
   return true;
 }
 
@@ -1239,16 +1471,34 @@ class SidepanelPanel implements Component {
     if (
       !values.length &&
       !languages &&
-      !piLensState.currentFile
+      !piLensState.currentFile &&
+      !piLensState.files.size
     )
       return [];
 
     const out = [this.sep(inner, "PI-LENS")];
     if (languages)
       out.push(
-        this.field("LANG", languages, inner, "muted"),
+        this.field(
+          "LANG",
+          marqueeToWidth(
+            languages,
+            Math.max(1, inner - 11),
+            this.frame,
+          ),
+          inner,
+          "muted",
+        ),
       );
-    if (piLensState.currentFile) {
+    const files = [...piLensState.files.entries()].sort(
+      ([a], [b]) => a.localeCompare(b),
+    );
+    const currentFileHasIssues = files.some(
+      ([path]) =>
+        path === piLensState.currentFile ||
+        displayPath(path) === displayPath(piLensState.currentFile),
+    );
+    if (piLensState.currentFile && !currentFileHasIssues) {
       const fileWidth = Math.max(1, inner - 11);
       out.push(
         this.field(
@@ -1262,6 +1512,63 @@ class SidepanelPanel implements Component {
           "text",
         ),
       );
+    }
+    if (files.length) {
+      const totals = files.reduce(
+        (sum, [, counts]) => ({
+          errors: sum.errors + counts.errors,
+          warnings: sum.warnings + counts.warnings,
+          info: sum.info + counts.info,
+        }),
+        emptyPiLensCounts(),
+      );
+      const errorLabel =
+        totals.errors === 1 ? "error" : "errors";
+      const warningLabel =
+        totals.warnings === 1 ? "warning" : "warnings";
+      const totalParts = [
+        `${totals.errors} ${errorLabel}`,
+        `${totals.warnings} ${warningLabel}`,
+      ];
+      if (totals.info)
+        totalParts.push(`${totals.info} info`);
+      out.push(
+        this.field(
+          "ISSUES",
+          marqueeToWidth(
+            `${files.length} ${files.length === 1 ? "file" : "files"} · ${totalParts.join(" · ")}`,
+            Math.max(1, inner - 11),
+            this.frame,
+          ),
+          inner,
+          totals.errors ? "error" : "warning",
+        ),
+      );
+      for (const [path, counts] of files) {
+        const parts: string[] = [];
+        if (counts.errors) parts.push(`${counts.errors}E`);
+        if (counts.warnings) parts.push(`${counts.warnings}W`);
+        if (counts.info) parts.push(`${counts.info}I`);
+        const countText = parts.join(" ");
+        const valueWidth = Math.max(1, inner - 11);
+        const pathWidth = Math.max(
+          1,
+          valueWidth - visibleWidth(` · ${countText}`),
+        );
+        const fileValue = `${marqueeToWidth(
+          displayPath(path),
+          pathWidth,
+          this.frame,
+        )} · ${countText}`;
+        out.push(
+          this.field(
+            "FILE",
+            fileValue,
+            inner,
+            counts.errors ? "error" : counts.warnings ? "warning" : "muted",
+          ),
+        );
+      }
     }
     const statusWidth = Math.max(1, inner - 1);
     out.push(
@@ -1413,11 +1720,17 @@ class SidepanelPanel implements Component {
     const th = this.theme;
     const out = [this.sep(inner, "PERFORMANCE")];
     const live = state.phase !== "idle" && perf.chars > 0;
-    const tps = live ? liveTps() : swap.srvTps || perf.tps;
+    const serverTpsFresh =
+      swap.srvTps > 0 &&
+      swap.srvTpsAt > 0 &&
+      Date.now() - swap.srvTpsAt < SERVER_RATE_STALE_MS;
+    let tps = perf.tps;
+    if (live) tps = liveTps();
+    else if (serverTpsFresh) tps = swap.srvTps;
     const tpsTone: ThemeColor = live ? "accent" : "success";
     let tpsSuffix = "";
     if (live) tpsSuffix = th.fg("dim", " ~live");
-    else if (swap.srvTps)
+    else if (serverTpsFresh)
       tpsSuffix = th.fg("dim", " server");
     out.push(
       this.frameLine(
@@ -1425,16 +1738,25 @@ class SidepanelPanel implements Component {
         inner,
       ),
     );
+    const serverPpsFresh =
+      swap.srvPps > 0 &&
+      swap.srvPpsAt > 0 &&
+      Date.now() - swap.srvPpsAt < SERVER_RATE_STALE_MS;
+    const pps = serverPpsFresh
+      ? swap.srvPps
+      : perf.pps;
+    let ppsDisplay = "—";
+    if (pps)
+      ppsDisplay = `${pps.toFixed(1)}${serverPpsFresh ? "" : " ~est"}`;
+    out.push(
+      this.field(
+        "PROMPT/S",
+        ppsDisplay,
+        inner,
+        "muted",
+      ),
+    );
     if (compact) return out;
-    if (swap.srvPps)
-      out.push(
-        this.field(
-          "PROMPT/S",
-          swap.srvPps.toFixed(1),
-          inner,
-          "muted",
-        ),
-      );
     const promptTotal = swap.cacheTokens + swap.inputTokens;
     if (promptTotal) {
       const hit = Math.round(
@@ -2027,6 +2349,7 @@ export default async function (pi: ExtensionAPI) {
       liveCtx = ctx;
       piLensState.currentFile = "";
       piLensState.languages.clear();
+      piLensState.files.clear();
       recountSession(ctx);
       pi.getCommands().some((c: { name: string }) => {
         if (
@@ -2101,6 +2424,8 @@ export default async function (pi: ExtensionAPI) {
       ctx: ExtensionContext,
     ) => {
       liveCtx = ctx;
+      // Prompt speed is model-specific; do not carry it across selections.
+      perf.pps = 0;
       if (ctx.mode === "tui")
         void preloadModel(ctx, event.model).catch(
           () => undefined,
@@ -2148,6 +2473,7 @@ export default async function (pi: ExtensionAPI) {
       perf.start = Date.now();
       perf.first = 0;
       perf.chars = 0;
+      perf.pps = 0;
     },
   );
 
@@ -2189,22 +2515,48 @@ export default async function (pi: ExtensionAPI) {
     if (perf.start) {
       const end = Date.now();
       perf.lastMs = end - perf.start;
-      if (perf.first) {
-        perf.ttft = perf.first - perf.start;
-        const genS = (end - perf.first) / 1000;
-        const out = m.usage?.output || perf.chars / 4;
-        if (genS > 0.05 && out) {
-          perf.tps = out / genS;
-          perf.peakTps = Math.max(perf.peakTps, perf.tps);
-        }
+      const firstTokenMs = perf.first
+        ? Math.max(0, perf.first - perf.start)
+        : 0;
+      const responseMs = Math.max(1, perf.lastMs);
+      const promptMs =
+        firstTokenMs >= MIN_PROMPT_SAMPLE_MS &&
+        firstTokenMs <= responseMs
+          ? firstTokenMs
+          : responseMs;
+      const promptTokens =
+        (m.usage?.input ?? 0) +
+        (m.usage?.cacheRead ?? 0) +
+        (m.usage?.cacheWrite ?? 0);
+      if (promptTokens > 0) {
+        const estimate =
+          promptTokens / (promptMs / 1000);
+        if (
+          Number.isFinite(estimate) &&
+          estimate <= MAX_ESTIMATED_PROMPT_PPS
+        )
+          perf.pps = estimate;
       }
+
+      const out = m.usage?.output || perf.chars / 4;
+      const generationMs =
+        firstTokenMs > 0 && firstTokenMs < responseMs
+          ? responseMs - firstTokenMs
+          : responseMs;
+      if (out > 0 && generationMs > 0) {
+        perf.tps = out / (generationMs / 1000);
+        perf.peakTps = Math.max(perf.peakTps, perf.tps);
+      }
+      if (firstTokenMs > 0) perf.ttft = firstTokenMs;
       perf.start = 0;
     }
     repaint();
-    setTimeout(
-      () => void refreshSwapActivity().then(repaint),
-      300,
-    );
+    setTimeout(() => {
+      const refreshes = [refreshSwapMetrics()];
+      if (swap.kind === "llama-swap")
+        refreshes.push(refreshSwapActivity());
+      void Promise.all(refreshes).then(() => repaint());
+    }, 300);
   });
 
   pi.on(
