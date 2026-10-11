@@ -41,7 +41,6 @@ import type {
 } from "@earendil-works/pi-tui";
 import {
   HStack,
-  sliceByColumn,
   truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
@@ -111,6 +110,89 @@ function bar(
   );
 }
 
+type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonObject
+  | readonly JsonValue[];
+type JsonObject = { [key: string]: JsonValue };
+type WireValue =
+  | object
+  | string
+  | number
+  | boolean
+  | null
+  | undefined;
+
+function decodeWireValue(
+  value: WireValue,
+): JsonValue | undefined {
+  if (value === null) return null;
+  if (Array.isArray(value)) {
+    const decoded: JsonValue[] = [];
+    for (const item of value) {
+      const next = decodeWireValue(item as WireValue);
+      if (next === undefined) return undefined;
+      decoded.push(next);
+    }
+    return decoded;
+  }
+  const tag = Object.prototype.toString.call(value);
+  if (tag === "[object String]") return String(value);
+  if (tag === "[object Number]") {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : undefined;
+  }
+  if (tag === "[object Boolean]") return Boolean(value);
+  if (tag !== "[object Object]") return undefined;
+  const decoded: JsonObject = {};
+  for (const [key, item] of Object.entries(
+    value as { [key: string]: WireValue },
+  )) {
+    const next = decodeWireValue(item);
+    if (next === undefined) return undefined;
+    decoded[key] = next;
+  }
+  return decoded;
+}
+
+function jsonObject(
+  value: JsonValue | undefined,
+): JsonObject | undefined {
+  if (
+    value === null ||
+    value === undefined ||
+    Array.isArray(value) ||
+    Object.prototype.toString.call(value) !==
+      "[object Object]"
+  )
+    return undefined;
+  return value as JsonObject;
+}
+
+function jsonString(
+  value: JsonValue | undefined,
+): string | undefined {
+  return Object.prototype.toString.call(value) ===
+    "[object String]"
+    ? String(value)
+    : undefined;
+}
+
+function jsonNumber(
+  value: JsonValue | undefined,
+): number | undefined {
+  if (
+    Object.prototype.toString.call(value) !==
+    "[object Number]"
+  )
+    return undefined;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
+}
+
 interface PiLensFindingCounts {
   errors: number;
   warnings: number;
@@ -125,6 +207,14 @@ const piLensState = {
 
 function emptyPiLensCounts(): PiLensFindingCounts {
   return { errors: 0, warnings: 0, info: 0 };
+}
+
+function piLensFallbackSeverity(
+  fallback: "error" | "warning" | "info",
+): keyof PiLensFindingCounts {
+  if (fallback === "error") return "errors";
+  if (fallback === "warning") return "warnings";
+  return "info";
 }
 
 function displayPath(target: string | undefined): string {
@@ -147,94 +237,75 @@ function piLensLanguage(path: string): string | undefined {
   return undefined;
 }
 
-function piLensEventPaths(data: unknown): string[] {
-  if (!data || typeof data !== "object") return [];
-  const record = data as Record<string, unknown>;
+function piLensEventPaths(data: JsonValue): string[] {
+  const record = jsonObject(data);
+  if (!record) return [];
   const paths: string[] = [];
-  if (typeof record.filePath === "string")
-    paths.push(record.filePath);
-  if (typeof record.file_path === "string")
-    paths.push(record.file_path);
-  if (typeof record.path === "string")
-    paths.push(record.path);
+  for (const key of ["filePath", "file_path", "path"]) {
+    const path = jsonString(record[key]);
+    if (path) paths.push(path);
+  }
   for (const key of ["paths", "files", "changedFiles"]) {
     const values = record[key];
     if (!Array.isArray(values)) continue;
     for (const value of values) {
-      if (typeof value === "string") paths.push(value);
-      else if (
-        value &&
-        typeof value === "object" &&
-        typeof (value as Record<string, unknown>).path ===
-          "string"
-      ) {
-        paths.push(
-          (value as Record<string, unknown>).path as string,
-        );
-      }
+      const path = jsonString(value) ??
+        jsonString(jsonObject(value)?.path);
+      if (path) paths.push(path);
     }
   }
   return paths;
 }
 
-function piLensFindingPath(value: unknown): string | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const record = value as Record<string, unknown>;
+function piLensFindingPath(
+  value: JsonValue,
+): string | undefined {
+  const record = jsonObject(value);
+  if (!record) return undefined;
   for (const key of ["filePath", "file_path", "path", "file"]) {
-    if (typeof record[key] === "string")
-      return record[key] as string;
+    const path = jsonString(record[key]);
+    if (path) return path;
   }
   return undefined;
 }
 
 function piLensFindingSeverity(
-  value: unknown,
+  value: JsonValue,
   fallback: "error" | "warning" | "info",
 ): keyof PiLensFindingCounts {
-  if (!value || typeof value !== "object")
-    return fallback === "error"
-      ? "errors"
-      : fallback === "warning"
-        ? "warnings"
-        : "info";
-  const record = value as Record<string, unknown>;
+  const record = jsonObject(value);
+  if (!record) return piLensFallbackSeverity(fallback);
   const raw = [
     record.severity,
     record.level,
     record.semantic,
     record.kind,
     record.type,
-  ].find((candidate) => typeof candidate === "string");
-  const text = typeof raw === "string" ? raw.toLowerCase() : "";
+  ].map(jsonString).find(Boolean);
+  const text = raw?.toLowerCase() ?? "";
   if (text.includes("error") || text.includes("block"))
     return "errors";
   if (text.includes("warn")) return "warnings";
   if (text.includes("info") || text.includes("hint"))
     return "info";
-  return fallback === "error"
-    ? "errors"
-    : fallback === "warning"
-      ? "warnings"
-      : "info";
+  return piLensFallbackSeverity(fallback);
 }
 
-function rememberPiLensEvent(data: unknown): void {
+function rememberPiLensEvent(data: JsonValue): void {
   const paths = piLensEventPaths(data);
   for (const path of paths) {
     piLensState.currentFile = path;
     const language = piLensLanguage(path);
     if (language) piLensState.languages.add(language);
   }
-  if (!data || typeof data !== "object") return;
-  const record = data as Record<string, unknown>;
+  const record = jsonObject(data);
+  if (!record) return;
   const primaryPath =
-    typeof record.filePath === "string"
-      ? record.filePath
-      : paths[0];
+    jsonString(record.filePath) ?? paths[0];
   const grouped = new Map<string, PiLensFindingCounts>();
 
   const addFinding = (
-    finding: unknown,
+    finding: JsonValue,
     fallback: "error" | "warning" | "info",
     fallbackPath = primaryPath,
   ): void => {
@@ -252,8 +323,8 @@ function rememberPiLensEvent(data: unknown): void {
     ? record.files
     : [];
   for (const value of fileEntries) {
-    if (!value || typeof value !== "object") continue;
-    const entry = value as Record<string, unknown>;
+    const entry = jsonObject(value);
+    if (!entry) continue;
     const path = piLensFindingPath(entry);
     if (!path) continue;
     const diagnostics = Array.isArray(entry.diagnostics)
@@ -292,18 +363,12 @@ function rememberPiLensEvent(data: unknown): void {
       addFinding(finding, "warning");
   }
 
-  const explicitErrors =
-    typeof record.errorCount === "number"
-      ? record.errorCount
-      : typeof record.errors === "number"
-        ? record.errors
-        : undefined;
-  const explicitWarnings =
-    typeof record.warningCount === "number"
-      ? record.warningCount
-      : typeof record.warnings === "number"
-        ? record.warnings
-        : undefined;
+  let explicitErrors = jsonNumber(record.errorCount);
+  if (explicitErrors === undefined)
+    explicitErrors = jsonNumber(record.errors);
+  let explicitWarnings = jsonNumber(record.warningCount);
+  if (explicitWarnings === undefined)
+    explicitWarnings = jsonNumber(record.warnings);
   if (
     !grouped.size &&
     primaryPath &&
@@ -341,22 +406,6 @@ function truncateTo(
   return truncateToWidth(target, maxLen);
 }
 
-function marqueeToWidth(
-  target: string,
-  maxWidth: number,
-  offset: number,
-): string {
-  if (visibleWidth(target) <= maxWidth) return target;
-  const loop = `${target}   `;
-  const period = visibleWidth(loop);
-  return sliceByColumn(
-    loop + loop,
-    offset % period,
-    maxWidth,
-    true,
-  );
-}
-
 function clampPanelWidth(width: number): number {
   if (!Number.isFinite(width)) return PANEL_WIDTH;
   return Math.min(
@@ -365,10 +414,16 @@ function clampPanelWidth(width: number): number {
   );
 }
 
-function nonNegativeNumber(value: unknown): number | undefined {
-  return typeof value === "number" &&
-    Number.isFinite(value) &&
-    value >= 0
+function finiteNumber(
+  value: number | undefined,
+): value is number {
+  return value !== undefined && Number.isFinite(value);
+}
+
+function nonNegativeNumber(
+  value: number | undefined,
+): number | undefined {
+  return finiteNumber(value) && value >= 0
     ? value
     : undefined;
 }
@@ -421,9 +476,9 @@ function animating(now = Date.now()): boolean {
   );
 }
 
-function toolTarget(args: unknown): string {
-  if (!args || typeof args !== "object") return "";
-  const a = args as Record<string, unknown>;
+function toolTarget(args: JsonObject): string {
+  const record = jsonObject(args);
+  if (!record) return "";
   for (const key of [
     "path",
     "file_path",
@@ -434,18 +489,15 @@ function toolTarget(args: unknown): string {
     "query",
     "url",
   ]) {
-    if (typeof a[key] === "string" && a[key])
-      return String(a[key]).replace(/\s+/g, " ").trim();
+    const value = jsonString(record[key]);
+    if (value) return value.replace(/\s+/g, " ").trim();
   }
-  const first = Object.values(a).find(
-    (v) =>
-      typeof v === "string" &&
-      v.length > 0 &&
-      v.length < 200,
-  );
-  return typeof first === "string"
-    ? first.replace(/\s+/g, " ").trim()
-    : "";
+  for (const value of Object.values(record)) {
+    const text = jsonString(value);
+    if (text && text.length < 200)
+      return text.replace(/\s+/g, " ").trim();
+  }
+  return "";
 }
 
 /* ── performance ── */
@@ -457,6 +509,8 @@ const perf = {
   start: 0,
   first: 0,
   chars: 0,
+  livePromptTokens: 0,
+  liveOutputTokens: 0,
   tps: 0,
   pps: 0,
   ttft: 0,
@@ -465,9 +519,16 @@ const perf = {
 };
 
 function liveTps(): number {
-  if (state.phase !== "idle" && perf.first && perf.chars) {
+  if (state.phase !== "idle" && perf.first) {
     const s = (Date.now() - perf.first) / 1000;
-    if (s > 0.3) return perf.chars / 4 / s;
+    if (s > 0.3) {
+      const outputTokens =
+        perf.liveOutputTokens > 0
+          ? perf.liveOutputTokens
+          : perf.chars / 4;
+      if (outputTokens > 0)
+        return outputTokens / s;
+    }
   }
   return perf.tps;
 }
@@ -1064,14 +1125,14 @@ async function refreshSwapActivity(): Promise<void> {
     const latest = latestRow?.tokens;
     if (!latest) return;
     let updated = false;
-    if (typeof latest.cache_tokens === "number") {
+    if (finiteNumber(latest.cache_tokens)) {
       swap.cacheTokens = Math.max(
         0,
         latest.cache_tokens,
       );
       updated = true;
     }
-    if (typeof latest.input_tokens === "number") {
+    if (finiteNumber(latest.input_tokens)) {
       swap.inputTokens = Math.max(
         0,
         latest.input_tokens,
@@ -1097,7 +1158,13 @@ interface SwapSlot {
   n_prompt_tokens?: number;
   n_prompt_tokens_processed?: number;
   n_prompt_tokens_cache?: number;
+  n_ctx?: number;
   progress?: number;
+  next_token?: Array<{
+    has_next_token?: boolean;
+    n_remain?: number;
+    n_decoded?: number;
+  }>;
   timings?: SwapSlotTimings;
 }
 
@@ -1169,6 +1236,8 @@ function resetSessionState(): void {
     start: 0,
     first: 0,
     chars: 0,
+    livePromptTokens: 0,
+    liveOutputTokens: 0,
     tps: 0,
     pps: 0,
     ttft: 0,
@@ -1201,48 +1270,84 @@ async function refreshLiveContext(): Promise<void> {
       const processed = slot.n_prompt_tokens_processed;
       const total = slot.n_prompt_tokens;
       return (
-        (typeof processed === "number" &&
-          Number.isFinite(processed) &&
-          processed > 0) ||
-        (typeof total === "number" &&
-          Number.isFinite(total) &&
-          total > 0)
+        (finiteNumber(processed) && processed > 0) ||
+        (finiteNumber(total) && total > 0)
       );
     });
     if (!busy.length) return;
-    const progressOf = (slot: SwapSlot): number =>
-      typeof slot.n_prompt_tokens_processed === "number" &&
-      Number.isFinite(slot.n_prompt_tokens_processed)
-        ? slot.n_prompt_tokens_processed
-        : slot.n_prompt_tokens ?? 0;
+    const progressOf = (slot: SwapSlot): number => {
+      if (finiteNumber(slot.n_prompt_tokens_processed))
+        return slot.n_prompt_tokens_processed;
+      return slot.n_prompt_tokens ?? 0;
+    };
     const now = Date.now();
     const activeSlot = busy.reduce((best, slot) =>
       progressOf(slot) > progressOf(best) ? slot : best,
     );
     const promptTokens = progressOf(activeSlot);
     const reportedProgress =
-      typeof activeSlot.progress === "number" &&
-      Number.isFinite(activeSlot.progress) &&
+      finiteNumber(activeSlot.progress) &&
       activeSlot.progress > 0 &&
       activeSlot.progress <= 1
         ? activeSlot.progress
         : undefined;
-    const contextTokens = liveCtx?.getContextUsage?.()?.tokens;
-    const estimatedTotal =
-      reportedProgress !== undefined
-        ? Math.ceil(promptTokens / reportedProgress)
-        : typeof contextTokens === "number" &&
-            contextTokens > promptTokens
-          ? contextTokens
-          : 0;
-    live.promptTotal = estimatedTotal;
+    const slotTotal =
+      finiteNumber(activeSlot.n_prompt_tokens) &&
+      activeSlot.n_prompt_tokens > 0
+        ? activeSlot.n_prompt_tokens
+        : 0;
+    const nRemain =
+      activeSlot.next_token?.[0]?.n_remain;
+    const promptBudget =
+      finiteNumber(activeSlot.n_ctx) &&
+      finiteNumber(nRemain) &&
+      nRemain >= 0
+        ? Math.max(0, activeSlot.n_ctx - nRemain)
+        : 0;
+    const contextTokens =
+      liveCtx?.getContextUsage?.()?.tokens ?? undefined;
+    let estimatedTotal = Math.max(
+      slotTotal,
+      promptBudget,
+    );
+    if (reportedProgress !== undefined)
+      estimatedTotal = Math.ceil(
+        promptTokens / reportedProgress,
+      );
+    else if (
+      !estimatedTotal &&
+      contextTokens !== undefined &&
+      contextTokens > promptTokens
+    )
+      estimatedTotal = contextTokens;
+    const generationStarted =
+      activeSlot.next_token?.some(
+        (token) =>
+          finiteNumber(token.n_decoded) &&
+          token.n_decoded > 0,
+      ) ?? false;
+    const promptFinished =
+      generationStarted ||
+      (promptBudget > 0
+        ? promptTokens >= promptBudget
+        : finiteNumber(activeSlot.n_prompt_tokens) &&
+          finiteNumber(activeSlot.n_prompt_tokens_processed) &&
+          activeSlot.n_prompt_tokens_processed >=
+            activeSlot.n_prompt_tokens);
+    live.promptTotal = promptFinished
+      ? promptTokens
+      : estimatedTotal;
     live.promptProcessed = promptTokens;
-    live.promptProgressKnown = estimatedTotal > 0;
+    live.promptProgressKnown = live.promptTotal > 0;
     live.promptTotalEstimated =
-      reportedProgress === undefined && estimatedTotal > 0;
+      !promptFinished &&
+      reportedProgress === undefined &&
+      promptBudget === 0 &&
+      slotTotal === 0 &&
+      estimatedTotal > 0;
     if (
-      typeof activeSlot.n_prompt_tokens === "number" &&
-      typeof activeSlot.n_prompt_tokens_cache === "number"
+      finiteNumber(activeSlot.n_prompt_tokens) &&
+      finiteNumber(activeSlot.n_prompt_tokens_cache)
     ) {
       swap.cacheTokens = Math.max(
         0,
@@ -1259,16 +1364,12 @@ async function refreshLiveContext(): Promise<void> {
     const timingPromptN = activeSlot.timings?.prompt_n;
     const timingPromptMs = activeSlot.timings?.prompt_ms;
     if (!perf.first) {
-      if (
-        typeof serverPps === "number" &&
-        Number.isFinite(serverPps) &&
-        serverPps > 0
-      ) {
+      if (finiteNumber(serverPps) && serverPps > 0) {
         live.promptPps = serverPps;
         live.promptPpsServer = true;
       } else if (
-        typeof timingPromptN === "number" &&
-        typeof timingPromptMs === "number" &&
+        finiteNumber(timingPromptN) &&
+        finiteNumber(timingPromptMs) &&
         timingPromptN > 0 &&
         timingPromptMs > 0
       ) {
@@ -1300,10 +1401,9 @@ async function refreshLiveContext(): Promise<void> {
       live.promptTokens = promptTokens;
       live.promptAt = now;
     }
-    live.tokens =
-      typeof activeSlot.n_prompt_tokens === "number"
-        ? activeSlot.n_prompt_tokens
-        : promptTokens;
+    live.tokens = finiteNumber(activeSlot.n_prompt_tokens)
+      ? activeSlot.n_prompt_tokens
+      : promptTokens;
     live.at = now;
   } catch {
     // the pi estimate stays
@@ -1378,7 +1478,7 @@ async function connectSwap(
   setSwapState("checking");
   const auth = await ctx.modelRegistry
     .getApiKeyAndHeaders(model)
-    .catch((err: unknown) => {
+    .catch((err) => {
       if (version === swapConnectionVersion)
         setSwapState(
           "error",
@@ -1389,14 +1489,19 @@ async function connectSwap(
   if (!auth || version !== swapConnectionVersion)
     return false;
   const base = normalizeServiceBase(model.baseUrl);
-  const headers = {
-    ...((auth.ok ? auth.headers : undefined) as
-      | Record<string, string>
-      | undefined),
-    ...(auth.ok && auth.apiKey
-      ? { Authorization: `Bearer ${auth.apiKey}` }
-      : {}),
-  };
+  const headers = Object.create(null) as Record<
+    string,
+    string
+  >;
+  if (auth.ok && auth.headers) {
+    for (const [key, value] of Object.entries(
+      auth.headers,
+    )) {
+      if (value !== null) headers[key] = value;
+    }
+  }
+  if (auth.ok && auth.apiKey)
+    headers.Authorization = `Bearer ${auth.apiKey}`;
   if (
     previousBase !== base ||
     previousKind !== model.provider ||
@@ -1561,11 +1666,585 @@ async function preloadModel(
 
 /* ──────────────────────────────────────────────────────── side panel ── */
 
-class SidepanelPanel implements Component {
-  private frame = 0;
-  private timer: ReturnType<typeof setInterval> | null =
-    null;
-  private cache:
+function panelPad(content: string, inner: number): string {
+  const width = visibleWidth(content);
+  if (width > inner) return truncateToWidth(content, inner);
+  return content + " ".repeat(inner - width);
+}
+
+function panelFrame(
+  panel: SidepanelPanel,
+  content: string,
+  inner: number,
+): string {
+  const border = (value: string) =>
+    panel.theme.fg("border", value);
+  return border("│") + panelPad(content, inner) + border("│");
+}
+
+function panelLabel(
+  panel: SidepanelPanel,
+  options: {
+    inner: number;
+    label: string;
+    left: string;
+    right: string;
+    tone: ThemeColor;
+  },
+): string {
+  const { inner, label, left, right, tone } = options;
+  const border = (value: string) =>
+    panel.theme.fg("border", value);
+  const text = ` ${truncateToWidth(label, inner - 4)} `;
+  const rest = Math.max(0, inner - visibleWidth(text) - 1);
+  return (
+    border(left + "─") +
+    panel.theme.fg(tone, text) +
+    border("─".repeat(rest) + right)
+  );
+}
+
+function panelSep(
+  panel: SidepanelPanel,
+  inner: number,
+  label: string,
+): string {
+  return panelLabel(panel, {
+    inner,
+    label,
+    left: "├",
+    right: "┤",
+    tone: "muted",
+  });
+}
+
+interface PanelFieldOptions {
+  label: string;
+  value: string;
+  inner: number;
+  tone?: ThemeColor;
+}
+
+function panelField(
+  panel: SidepanelPanel,
+  options: PanelFieldOptions,
+): string {
+  const {
+    label,
+    value,
+    inner,
+    tone = "text",
+  } = options;
+  const labelText = panel.theme.fg("dim", label.padEnd(9));
+  return panelFrame(
+    panel,
+    " " + labelText + panel.theme.fg(tone, value),
+    inner,
+  );
+}
+
+function panelFieldRows(
+  panel: SidepanelPanel,
+  options: PanelFieldOptions,
+): string[] {
+  const width = Math.max(1, options.inner - 11);
+  const lines = wrapTextWithAnsi(options.value, width);
+  if (!lines.length) lines.push("");
+  return lines.map((value, index) =>
+    index === 0
+      ? panelField(panel, { ...options, value })
+      : panelFrame(panel, " ".repeat(10) + value, options.inner),
+  );
+}
+
+function locationRows(
+  panel: SidepanelPanel,
+  inner: number,
+): string[] {
+  const out = [panelSep(panel, inner, "LOCATION")];
+  out.push(
+    ...panelFieldRows(panel, {
+      label: "CWD",
+      value: displayPath(liveCtx?.cwd),
+      inner,
+      tone: "text",
+    }),
+    ...panelFieldRows(panel, {
+      label: "BRANCH",
+      value: truncateTo(
+        footerDataRef?.getGitBranch?.() ?? undefined,
+        inner - 11,
+      ),
+      inner,
+      tone: "muted",
+    }),
+  );
+  return out;
+}
+
+function extensionRows(
+  panel: SidepanelPanel,
+  inner: number,
+): string[] {
+  const statuses = extensionStatusEntries().filter(
+    ([key]) => !key.toLowerCase().startsWith("pi-lens"),
+  );
+  if (!statuses.length) return [];
+  const out = [panelSep(panel, inner, "EXTENSIONS")];
+  const valueWidth = Math.max(1, inner - 1);
+  for (const [, value] of statuses) {
+    const wrapped = wrapTextWithAnsi(value, valueWidth);
+    for (const line of wrapped)
+      out.push(panelFrame(panel, ` ${line}`, inner));
+  }
+  return out;
+}
+
+function sessionRows(
+  panel: SidepanelPanel,
+  inner: number,
+  compact: boolean,
+): string[] {
+  const out = [panelSep(panel, inner, "SESSION")];
+  const model = liveCtx?.model;
+  out.push(
+    panelField(panel, { label: "MODEL", value: truncateTo(model?.id, inner - 11), inner: inner, tone: "text" }),
+  );
+  if (!compact)
+    out.push(
+      panelField(panel, { label: "PROVIDER", value: truncateTo(String(model?.provider), inner - 11), inner: inner, tone: "muted" }),
+    );
+  out.push(
+    panelField(panel, { label: "THINKING", value: liveCtx?.thinkingLevel ?? "off", inner: inner, tone: "muted" }),
+  );
+  return out;
+}
+
+function costRow(
+  panel: SidepanelPanel,
+  inner: number,
+): string {
+  if (!swap.gpus.length)
+    return panelField(panel, { label: "COST", value: "—", inner: inner, tone: "muted" });
+  const kwhPrice = ui.kwhPrice;
+  if (kwhPrice === undefined)
+    return panelField(panel, { label: "COST", value: "→ /sidepanel cost", inner: inner, tone: "dim" });
+  const fmtMoney = (wh: number) => {
+    const price = (wh / 1000) * kwhPrice;
+    return ui.currency === "USD"
+      ? `$${price.toFixed(3)}`
+      : `${price.toFixed(3)} €`;
+  };
+  return panelField(panel, { label: "COST", value: fmtMoney(totalWh()) +
+    panel.theme.fg("dim", ` (ses ${fmtMoney(swap.energyWh)})`), inner: inner, tone: "warning" });
+}
+
+function statusSection(
+  panel: SidepanelPanel,
+  inner: number,
+): string[] {
+  const th = panel.theme;
+  const now = Date.now();
+  const pulse = animating(now)
+    ? th.fg("accent", "◈")
+    : th.fg("dim", "○");
+  const idle = state.phase === "idle";
+  const fallen = now - state.lastFailAt < FAIL_FLASH_MS;
+  let title: string;
+  let titleTone: ThemeColor = "accent";
+  let status: string;
+  if (state.phase === "tool" || (idle && fallen)) {
+    title = fallen
+      ? `FAILED · ${state.lastFailTool}`
+      : `${state.toolName || "tool"} · ${secsSince(state.phaseSince, now)}s`;
+    titleTone = fallen ? "error" : "warning";
+    const target =
+      (fallen
+        ? state.lastFailTarget || state.lastFailTool
+        : state.toolTarget || state.toolName) || "tool";
+    status = `${pulse} ${th.fg(fallen ? "error" : "text", truncateToWidth(target, inner - 4))}`;
+  } else if (state.phase === "thinking") {
+    title = `THINKING · ${secsSince(state.phaseSince, now)}s`;
+    titleTone = "accent";
+    status = `${pulse} deliberating`;
+  } else if (state.phase === "responding") {
+    const tps = liveTps();
+    title = `RESPONDING${tps ? ` · ${tps.toFixed(1)} tok/s` : ""}`;
+    titleTone = "success";
+    status = `${pulse} streaming`;
+  } else if (state.compacting) {
+    title = `COMPACTING · ${state.compactBy || "context"} · ${secsSince(state.compactSince, now)}s`;
+    titleTone = "warning";
+    status = `${pulse} compacting context`;
+  } else if (
+    idle && (swap.state === "checking" || swap.state === "loading")
+  ) {
+    title = swap.state === "loading"
+      ? `LOADING · ${secsSince(swap.since)}s`
+      : "CHECKING";
+    titleTone = "warning";
+    status = `${pulse} loading model`;
+  } else if (idle && swap.state === "error") {
+    title = "OFFLINE";
+    titleTone = "error";
+    status = `${pulse} swap error`;
+  } else if (idle && swap.state === "asleep") {
+    title = "ASLEEP · type to wake";
+    titleTone = "muted";
+    status = `${pulse} model asleep`;
+  } else if (
+    idle && swap.state === "ready" &&
+    now - swap.since < ONLINE_MS
+  ) {
+    title = swap.loadMs ? `ONLINE · ${fmtMs(swap.loadMs)}` : "ONLINE";
+    titleTone = "success";
+    status = `${pulse} model ready`;
+  } else {
+    title = "STANDBY";
+    titleTone = "muted";
+    status = `${pulse} at rest`;
+  }
+  return [
+    panelLabel(panel, {
+      inner,
+      label: title,
+      left: "┌",
+      right: "┐",
+      tone: titleTone,
+    }),
+    panelFrame(panel, status, inner),
+  ];
+}
+
+function telemetryRows(
+  panel: SidepanelPanel,
+  inner: number,
+  compact: boolean,
+): string[] {
+  const th = panel.theme;
+  const out = [panelSep(panel, inner, "TELEMETRY")];
+  if (!compact) {
+    out.push(
+      panelFrame(panel, ` ${th.fg("dim", "TURNS".padEnd(9))}${th.fg("text", String(state.turns))}`,
+      inner,),
+      panelFrame(panel, ` ${th.fg("dim", "TOKENS".padEnd(9))}${th.fg("success", "↑" + fmtTokens(tokens.input))} ${th.fg("warning", "↓" + fmtTokens(tokens.output))}`,
+      inner,),
+    );
+    if (tokens.cacheRead)
+      out.push(panelField(panel, { label: "CACHE", value: fmtTokens(tokens.cacheRead), inner: inner, tone: "muted" }));
+    if (tokens.cost)
+      out.push(panelField(panel, { label: "API COST", value: `$${tokens.cost.toFixed(3)}`, inner: inner, tone: "muted" }));
+  }
+  const sync = syncPercent();
+  out.push(
+    panelFrame(panel, sync === null
+      ? ` ${th.fg("dim", "SYNC".padEnd(9))}${th.fg("dim", "— no tools")}`
+      : ` ${th.fg("dim", "SYNC".padEnd(9))}${bar(th, Math.round(sync / 10), 10, syncTone(sync))} ${th.fg(syncTone(sync), `${sync.toFixed(0)}%`)}`,
+    inner,),
+    panelFrame(panel, ` ${th.fg("dim", "TOOLS".padEnd(9))}${th.fg("success", `✓${state.toolOk}`)}${th.fg("dim", " Success ")}${th.fg(state.toolFail ? "error" : "dim", `✗${state.toolFail}`)}${th.fg("dim", " Failed")}`,
+    inner,),
+  );
+  const usage = contextUsage();
+  const percent = usage?.percent ?? 0;
+  const liveMark = usage?.live ? th.fg("accent", " ▲ live") : "";
+  if (!compact && usage?.contextWindow)
+    out.push(
+      panelField(panel, { label: "CONTEXT", value: `${usage.tokens == null ? "?" : fmtTokens(usage.tokens)} / ${fmtTokens(usage.contextWindow)}`, inner: inner, tone: "muted" }),
+    );
+  out.push(
+    panelFrame(panel, ` ${th.fg("dim", "WINDOW".padEnd(9))}${bar(th, Math.round(percent / 10), 10, usageTone(percent))} ${th.fg(usageTone(percent), `${percent.toFixed(0)}%`)}${liveMark}`,
+    inner,),
+  );
+  if (!compact && (state.pruned || state.thinkCuts)) {
+    const cuts = state.thinkCuts ? ` ✂${state.thinkCuts}` : "";
+    out.push(
+      panelField(panel, { label: "HYGIENE", value: `-${fmtTokens(state.pruned)}${cuts}`, inner: inner, tone: state.thinkCuts ? "warning" : "muted" }),
+    );
+  }
+  return out;
+}
+
+function piLensRows(
+  panel: SidepanelPanel,
+  inner: number,
+): string[] {
+  const values = piLensStatusValues();
+  const languages = [...piLensState.languages]
+    .sort((a, b) => a.localeCompare(b))
+    .join(" ");
+  if (
+    !values.length &&
+    !languages &&
+    !piLensState.currentFile &&
+    !piLensState.files.size
+  )
+    return [];
+  const out = [panelSep(panel, inner, "PI-LENS")];
+  if (languages)
+    out.push(
+      ...panelFieldRows(panel, {
+        label: "LANG",
+        value: languages,
+        inner,
+        tone: "muted",
+      }),
+    );
+  const files = [...piLensState.files.entries()].sort(
+    ([a], [b]) => a.localeCompare(b),
+  );
+  const currentFileHasIssues = files.some(
+    ([path]) =>
+      path === piLensState.currentFile ||
+      displayPath(path) === displayPath(piLensState.currentFile),
+  );
+  if (piLensState.currentFile && !currentFileHasIssues)
+    out.push(
+      ...panelFieldRows(panel, {
+        label: "FILE",
+        value: displayPath(piLensState.currentFile),
+        inner,
+        tone: "text",
+      }),
+    );
+  if (files.length) {
+    const totals = files.reduce(
+      (sum, [, counts]) => ({
+        errors: sum.errors + counts.errors,
+        warnings: sum.warnings + counts.warnings,
+        info: sum.info + counts.info,
+      }),
+      emptyPiLensCounts(),
+    );
+    const totalParts = [
+      `${totals.errors} ${totals.errors === 1 ? "error" : "errors"}`,
+      `${totals.warnings} ${totals.warnings === 1 ? "warning" : "warnings"}`,
+    ];
+    if (totals.info) totalParts.push(`${totals.info} info`);
+    out.push(
+      ...panelFieldRows(panel, {
+        label: "ISSUES",
+        value: `${files.length} ${files.length === 1 ? "file" : "files"} · ${totalParts.join(" · ")}`,
+        inner,
+        tone: totals.errors ? "error" : "warning",
+      }),
+    );
+    for (const [path, counts] of files) {
+      const parts: string[] = [];
+      if (counts.errors) parts.push(`${counts.errors}E`);
+      if (counts.warnings) parts.push(`${counts.warnings}W`);
+      if (counts.info) parts.push(`${counts.info}I`);
+      let fileTone: ThemeColor = "muted";
+      if (counts.errors) fileTone = "error";
+      else if (counts.warnings) fileTone = "warning";
+      out.push(
+        ...panelFieldRows(panel, {
+          label: "FILE",
+          value: `${displayPath(path)} · ${parts.join(" ")}`,
+          inner,
+          tone: fileTone,
+        }),
+      );
+    }
+  }
+  const statusWidth = Math.max(1, inner - 1);
+  for (const value of values) {
+    const lines = wrapTextWithAnsi(value, statusWidth);
+    for (const line of lines)
+      out.push(panelFrame(panel, ` ${line}`, inner));
+  }
+  return out;
+}
+
+function performanceRows(
+  panel: SidepanelPanel,
+  inner: number,
+  compact: boolean,
+): string[] {
+  const th = panel.theme;
+  const out = [panelSep(panel, inner, "PERFORMANCE")];
+  const active = perf.start > 0;
+  const outputLive = active && perf.chars > 0;
+  const now = Date.now();
+  const promptLive =
+    live.promptPps > 0 && live.at > 0 &&
+    now - live.at < LIVE_STALE_MS;
+  const upstreamTpsFresh =
+    upstreamMetrics.tps > 0 && upstreamMetrics.tpsAt > 0 &&
+    now - upstreamMetrics.tpsAt < SERVER_RATE_STALE_MS;
+  const swapTpsFresh =
+    swap.srvTps > 0 && swap.srvTpsAt > 0 &&
+    now - swap.srvTpsAt < SERVER_RATE_STALE_MS;
+  const serverTpsFresh = upstreamTpsFresh || swapTpsFresh;
+  const serverTps = upstreamTpsFresh
+    ? upstreamMetrics.tps
+    : swap.srvTps;
+  const requestTpsFresh =
+    active && upstreamTpsFresh &&
+    upstreamMetrics.tpsAt >= perf.start;
+  let tps = perf.tps;
+  if (requestTpsFresh) tps = upstreamMetrics.tps;
+  else if (active) tps = outputLive ? liveTps() : 0;
+  else if (serverTpsFresh) tps = serverTps;
+  const tpsTone: ThemeColor =
+    requestTpsFresh || !outputLive ? "success" : "accent";
+  let tpsSuffix = "";
+  if (requestTpsFresh) tpsSuffix = th.fg("dim", " server");
+  else if (outputLive) tpsSuffix = th.fg("dim", " ~live");
+  else if (serverTpsFresh) tpsSuffix = th.fg("dim", " server");
+  out.push(
+    panelFrame(panel, ` ${th.fg("dim", "TOK/S".padEnd(9))}${th.fg(tpsTone, tps ? tps.toFixed(1) : "—")}${tpsSuffix}`,
+    inner,),
+  );
+  const upstreamPpsFresh =
+    upstreamMetrics.promptPps > 0 && upstreamMetrics.promptPpsAt > 0 &&
+    now - upstreamMetrics.promptPpsAt < SERVER_RATE_STALE_MS;
+  const swapPpsFresh =
+    swap.srvPps > 0 && swap.srvPpsAt > 0 &&
+    now - swap.srvPpsAt < SERVER_RATE_STALE_MS;
+  const serverPpsFresh = upstreamPpsFresh || swapPpsFresh;
+  const serverPps = upstreamPpsFresh
+    ? upstreamMetrics.promptPps
+    : swap.srvPps;
+  const requestPpsFresh =
+    active && upstreamPpsFresh &&
+    upstreamMetrics.promptPpsAt >= perf.start;
+  const livePromptEstimate =
+    active &&
+    !promptLive &&
+    !perf.first &&
+    perf.livePromptTokens > 0 &&
+    perf.start > 0;
+  let pps = perf.pps;
+  let ppsSuffix = " ~est";
+  if (promptLive) {
+    pps = live.promptPps;
+    ppsSuffix = live.promptPpsServer ? " server" : " ~live";
+  } else if (requestPpsFresh) {
+    pps = upstreamMetrics.promptPps;
+    ppsSuffix = " server";
+  } else if (livePromptEstimate) {
+    const elapsed = (now - perf.start) / 1000;
+    pps = elapsed > 0
+      ? perf.livePromptTokens / elapsed
+      : 0;
+    ppsSuffix = " ~live";
+  } else if (active) {
+    pps = 0;
+    ppsSuffix = "";
+  } else if (serverPpsFresh) {
+    pps = serverPps;
+    ppsSuffix = "";
+  }
+  let ppsDisplay = "—";
+  if (pps) ppsDisplay = `${pps.toFixed(1)}${ppsSuffix}`;
+  out.push(panelField(panel, { label: "PROMPT/S", value: ppsDisplay, inner: inner, tone: "muted" }));
+  if (active && live.promptProcessed > 0) {
+    if (live.promptProgressKnown && live.promptTotal > 0) {
+      const progress = Math.min(
+        1,
+        Math.max(0, live.promptProcessed / live.promptTotal),
+      );
+      const percent = Math.round(progress * 100);
+      const estimateMark = live.promptTotalEstimated ? "~" : "";
+      out.push(
+        panelField(panel, { label: "PROGRESS", value: `${bar(th, Math.round(progress * 10), 10, "accent")} ${estimateMark}${percent}% ${fmtTokens(live.promptProcessed)}/${fmtTokens(live.promptTotal)}`, inner: inner, tone: "muted" }),
+      );
+    } else {
+      out.push(
+        panelField(panel, { label: "PROGRESS", value: `${fmtTokens(live.promptProcessed)} processed`, inner: inner, tone: "muted" }),
+      );
+    }
+  }
+  if (compact) return out;
+  const promptTotal = swap.cacheTokens + swap.inputTokens;
+  if (swap.kvKnown && promptTotal) {
+    const hit = Math.round((swap.cacheTokens / promptTotal) * 100);
+    out.push(
+      panelField(panel, { label: "KV CACHE", value: `${fmtTokens(swap.cacheTokens)}/${fmtTokens(promptTotal)} hit ${hit}%`, inner: inner, tone: "muted" }),
+    );
+  }
+  out.push(
+    panelField(panel, { label: "PEAK", value: perf.peakTps ? `${perf.peakTps.toFixed(1)} tok/s` : "—", inner: inner, tone: "muted" }),
+    panelField(panel, { label: "TTFT", value: perf.ttft ? fmtMs(perf.ttft) : "—", inner: inner, tone: "muted" }),
+  );
+  let duration = "—";
+  if (perf.start)
+    duration = fmtMs(Math.max(1, Date.now() - perf.start));
+  else if (perf.lastMs) duration = fmtMs(perf.lastMs);
+  out.push(panelField(panel, { label: "DURATION", value: duration, inner: inner, tone: "muted" }));
+  const up = Math.floor((Date.now() - sessionStart) / 60000);
+  out.push(
+    panelField(panel, { label: "UPTIME", value: `${Math.floor(up / 60)}h ${String(up % 60).padStart(2, "0")}m`, inner: inner, tone: "muted" }),
+  );
+  return out;
+}
+
+function swapRows(
+  panel: SidepanelPanel,
+  inner: number,
+  compact: boolean,
+): string[] {
+  if (!swap.base) return [];
+  const th = panel.theme;
+  const section =
+    swap.kind === "ninfer" ? "NINFER" : "LLAMA-SWAP";
+  const out = [panelSep(panel, inner, section)];
+  let st: string;
+  if (swap.state === "ready") st = th.fg("success", "IN VRAM");
+  else if (swap.state === "asleep") st = th.fg("muted", "ASLEEP");
+  else if (swap.state === "error") st = th.fg("error", "OFFLINE");
+  else if (swap.state === "loading")
+    st = th.fg("warning", `LOADING ${secsSince(swap.since)}s`);
+  else st = th.fg("warning", "CHECKING");
+  const load =
+    swap.state === "ready" && swap.loadMs
+      ? th.fg("dim", ` load ${fmtMs(swap.loadMs)}`)
+      : "";
+  out.push(
+    panelFrame(panel, ` ${th.fg("dim", "STATUS".padEnd(9))}${st}${load}`,
+    inner,),
+  );
+  if (compact) return [...out, costRow(panel, inner)];
+  if (swap.state === "error")
+    out.push(panelFrame(panel, " " + th.fg("error", swap.error), inner));
+  const gib = (n: number) => n / 2 ** 30;
+  for (const [i, g] of swap.gpus.entries()) {
+    const pct = g.memTotal
+      ? (g.memUsed / g.memTotal) * 100
+      : 0;
+    out.push(
+      panelFrame(panel, ` ${th.fg("dim", `VRAM${i}`.padEnd(9))}${bar(th, Math.round(pct / 10), 10, "accent")} ${th.fg("muted", `${gib(g.memUsed).toFixed(1)}/${Math.round(gib(g.memTotal))}G`)}`,
+      inner,),
+      panelFrame(panel, ` ${th.fg("dim", `GPU${i}`.padEnd(9))}${th.fg(g.util > 0 ? "accent" : "muted", `${Math.round(g.util)}%`.padEnd(6))}${th.fg(g.temp >= 80 ? "error" : "muted", `${Math.round(g.temp)}°C`.padEnd(7))}${th.fg("muted", `${Math.round(g.power)}W`)}`,
+      inner,),
+    );
+  }
+  if (swap.ramTotal)
+    out.push(
+      panelField(panel, { label: "RAM", value: `${gib(swap.ramUsed).toFixed(1)} / ${Math.round(gib(swap.ramTotal))}G`, inner: inner, tone: "muted" }),
+    );
+  if (swap.gpus.length)
+    out.push(
+      panelField(panel, { label: "ENERGY", value: `${(totalWh() / 1000).toFixed(3)} kWh`, inner: inner, tone: "muted" }),
+    );
+  out.push(costRow(panel, inner));
+  return out;
+}
+
+interface SidepanelPanel extends Component {
+  theme: Theme;
+  frame: number;
+  fillHeight?: () => number;
+  invalidate(): void;
+  dispose(): void;
+}
+
+function createSidepanelPanel(
+  tui: TUI,
+  theme: Theme,
+): SidepanelPanel {
+  let timer: ReturnType<typeof setInterval> | null = null;
+  let cache:
     | {
         at: number;
         inner: number;
@@ -1573,805 +2252,71 @@ class SidepanelPanel implements Component {
         lines: string[];
       }
     | undefined;
-  fillHeight?: () => number;
+  const panel: SidepanelPanel = {
+    theme,
+    frame: 0,
+    invalidate(): void {
+      cache = undefined;
+    },
+    dispose(): void {
+      if (timer) clearInterval(timer);
+      timer = null;
+    },
 
-  constructor(
-    private readonly tui: TUI,
-    private readonly theme: Theme,
-  ) {
-    this.timer = setInterval(() => {
-      this.frame++;
-      const cwd = displayPath(liveCtx?.cwd);
-      const cwdNeedsScroll =
-        visibleWidth(cwd) > panelWidth - 13;
+    render(width: number): string[] {
+      const inner = Math.max(24, width - 2);
+      const now = Date.now();
       if (
-        animating() ||
-        cwdNeedsScroll ||
-        this.frame % 8 === 0
-      )
-        this.tui.requestRender();
-    }, 125);
-  }
-
-  invalidate(): void {
-    this.cache = undefined;
-  }
-
-  dispose(): void {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
-  }
-
-  /* ── drawing helpers ── */
-
-  private pad(content: string, inner: number): string {
-    const w = visibleWidth(content);
-    if (w > inner) return truncateToWidth(content, inner);
-    return content + " ".repeat(inner - w);
-  }
-
-  private frameLine(
-    content: string,
-    inner: number,
-  ): string {
-    const b = (s: string) => this.theme.fg("border", s);
-    return b("│") + this.pad(content, inner) + b("│");
-  }
-
-  private labelLine(
-    inner: number,
-    label: string,
-    left: string,
-    right: string,
-    tone: ThemeColor,
-  ): string {
-    const b = (s: string) => this.theme.fg("border", s);
-    const text = ` ${truncateToWidth(label, inner - 4)} `;
-    const rest = Math.max(
-      0,
-      inner - visibleWidth(text) - 1,
-    );
-    return (
-      b(left + "─") +
-      this.theme.fg(tone, text) +
-      b("─".repeat(rest) + right)
-    );
-  }
-
-  private sep(inner: number, label: string): string {
-    return this.labelLine(inner, label, "├", "┤", "muted");
-  }
-
-  private field(
-    label: string,
-    value: string,
-    inner: number,
-    tone: ThemeColor = "text",
-  ): string {
-    const l = this.theme.fg("dim", label.padEnd(9));
-    return this.frameLine(
-      " " + l + this.theme.fg(tone, value),
-      inner,
-    );
-  }
-
-  /* ── top of the panel: status display ── */
-
-  private statusSection(inner: number): string[] {
-    const th = this.theme;
-    const now = Date.now();
-    const pulse = animating(now)
-      ? th.fg("accent", "◈")
-      : th.fg("dim", "○");
-
-    const idle = state.phase === "idle";
-    const fallen = now - state.lastFailAt < FAIL_FLASH_MS;
-
-    let title: string;
-    let titleTone: ThemeColor = "accent";
-    let status: string;
-
-    if (state.phase === "tool" || (idle && fallen)) {
-      title = fallen
-        ? `FAILED · ${state.lastFailTool}`
-        : `${state.toolName || "tool"} · ${secsSince(state.phaseSince, now)}s`;
-      titleTone = fallen ? "error" : "warning";
-      const target =
-        (fallen
-          ? state.lastFailTarget || state.lastFailTool
-          : state.toolTarget || state.toolName) || "tool";
-      status = `${pulse} ${th.fg(fallen ? "error" : "text", truncateToWidth(target, inner - 4))}`;
-    } else if (state.phase === "thinking") {
-      title = `THINKING · ${secsSince(state.phaseSince, now)}s`;
-      titleTone = "accent";
-      status = `${pulse} deliberating`;
-    } else if (state.phase === "responding") {
-      const tps = liveTps();
-      title = `RESPONDING${tps ? ` · ${tps.toFixed(1)} tok/s` : ""}`;
-      titleTone = "success";
-      status = `${pulse} streaming`;
-    } else if (state.compacting) {
-      title = `COMPACTING · ${state.compactBy || "context"} · ${secsSince(state.compactSince, now)}s`;
-      titleTone = "warning";
-      status = `${pulse} compacting context`;
-    } else if (
-      idle &&
-      (swap.state === "checking" ||
-        swap.state === "loading")
-    ) {
-      title =
-        swap.state === "loading"
-          ? `LOADING · ${secsSince(swap.since)}s`
-          : "CHECKING";
-      titleTone = "warning";
-      status = `${pulse} loading model`;
-    } else if (idle && swap.state === "error") {
-      title = "OFFLINE";
-      titleTone = "error";
-      status = `${pulse} swap error`;
-    } else if (idle && swap.state === "asleep") {
-      title = "ASLEEP · type to wake";
-      titleTone = "muted";
-      status = `${pulse} model asleep`;
-    } else if (
-      idle &&
-      swap.state === "ready" &&
-      now - swap.since < ONLINE_MS
-    ) {
-      title = swap.loadMs
-        ? `ONLINE · ${fmtMs(swap.loadMs)}`
-        : "ONLINE";
-      titleTone = "success";
-      status = `${pulse} model ready`;
-    } else {
-      title = "STANDBY";
-      titleTone = "muted";
-      status = `${pulse} at rest`;
-    }
-
-    const out: string[] = [];
-    out.push(
-      this.labelLine(inner, title, "┌", "┐", titleTone),
-    );
-    out.push(this.frameLine(status, inner));
-    return out;
-  }
-
-  /* ── data rows ── */
-
-  private locationRows(inner: number): string[] {
-    const out = [this.sep(inner, "LOCATION")];
-    const cwdWidth = Math.max(1, inner - 11);
-    out.push(
-      this.field(
-        "CWD",
-        marqueeToWidth(
-          displayPath(liveCtx?.cwd),
-          cwdWidth,
-          this.frame,
-        ),
-        inner,
-        "text",
-      ),
-    );
-    out.push(
-      this.field(
-        "BRANCH",
-        truncateTo(
-          footerDataRef?.getGitBranch?.() ?? undefined,
-          inner - 11,
-        ),
-        inner,
-        "muted",
-      ),
-    );
-    return out;
-  }
-
-  private extensionRows(inner: number): string[] {
-    const statuses = extensionStatusEntries().filter(
-      ([key]) => !key.toLowerCase().startsWith("pi-lens"),
-    );
-    if (!statuses.length) return [];
-    const out = [this.sep(inner, "EXTENSIONS")];
-    const valueWidth = Math.max(1, inner - 1);
-    for (const [, value] of statuses) {
-      const wrapped = wrapTextWithAnsi(value, valueWidth);
-      for (const line of wrapped)
-        out.push(this.frameLine(` ${line}`, inner));
-    }
-    return out;
-  }
-
-  private piLensRows(inner: number): string[] {
-    const values = piLensStatusValues();
-    const languages = [...piLensState.languages]
-      .sort((a, b) => a.localeCompare(b))
-      .join(" ");
-    if (
-      !values.length &&
-      !languages &&
-      !piLensState.currentFile &&
-      !piLensState.files.size
-    )
-      return [];
-
-    const out = [this.sep(inner, "PI-LENS")];
-    if (languages)
-      out.push(
-        this.field(
-          "LANG",
-          marqueeToWidth(
-            languages,
-            Math.max(1, inner - 11),
-            this.frame,
-          ),
-          inner,
-          "muted",
-        ),
-      );
-    const files = [...piLensState.files.entries()].sort(
-      ([a], [b]) => a.localeCompare(b),
-    );
-    const currentFileHasIssues = files.some(
-      ([path]) =>
-        path === piLensState.currentFile ||
-        displayPath(path) === displayPath(piLensState.currentFile),
-    );
-    if (piLensState.currentFile && !currentFileHasIssues) {
-      const fileWidth = Math.max(1, inner - 11);
-      out.push(
-        this.field(
-          "FILE",
-          marqueeToWidth(
-            displayPath(piLensState.currentFile),
-            fileWidth,
-            this.frame,
-          ),
-          inner,
-          "text",
-        ),
-      );
-    }
-    if (files.length) {
-      const totals = files.reduce(
-        (sum, [, counts]) => ({
-          errors: sum.errors + counts.errors,
-          warnings: sum.warnings + counts.warnings,
-          info: sum.info + counts.info,
-        }),
-        emptyPiLensCounts(),
-      );
-      const errorLabel =
-        totals.errors === 1 ? "error" : "errors";
-      const warningLabel =
-        totals.warnings === 1 ? "warning" : "warnings";
-      const totalParts = [
-        `${totals.errors} ${errorLabel}`,
-        `${totals.warnings} ${warningLabel}`,
-      ];
-      if (totals.info)
-        totalParts.push(`${totals.info} info`);
-      out.push(
-        this.field(
-          "ISSUES",
-          marqueeToWidth(
-            `${files.length} ${files.length === 1 ? "file" : "files"} · ${totalParts.join(" · ")}`,
-            Math.max(1, inner - 11),
-            this.frame,
-          ),
-          inner,
-          totals.errors ? "error" : "warning",
-        ),
-      );
-      for (const [path, counts] of files) {
-        const parts: string[] = [];
-        if (counts.errors) parts.push(`${counts.errors}E`);
-        if (counts.warnings) parts.push(`${counts.warnings}W`);
-        if (counts.info) parts.push(`${counts.info}I`);
-        const countText = parts.join(" ");
-        const valueWidth = Math.max(1, inner - 11);
-        const pathWidth = Math.max(
-          1,
-          valueWidth - visibleWidth(` · ${countText}`),
-        );
-        const fileValue = `${marqueeToWidth(
-          displayPath(path),
-          pathWidth,
-          this.frame,
-        )} · ${countText}`;
-        out.push(
-          this.field(
-            "FILE",
-            fileValue,
-            inner,
-            counts.errors ? "error" : counts.warnings ? "warning" : "muted",
-          ),
-        );
-      }
-    }
-    const statusWidth = Math.max(1, inner - 1);
-    out.push(
-      ...values.map((value) =>
-        this.frameLine(
-          ` ${marqueeToWidth(value, statusWidth, this.frame)}`,
-          inner,
-        ),
-      ),
-    );
-    return out;
-  }
-
-  private sessionRows(
-    inner: number,
-    compact: boolean,
-  ): string[] {
-    const out = [this.sep(inner, "SESSION")];
-    const model = liveCtx?.model;
-    out.push(
-      this.field(
-        "MODEL",
-        truncateTo(model?.id, inner - 11),
-        inner,
-        "text",
-      ),
-    );
-    if (!compact)
-      out.push(
-        this.field(
-          "PROVIDER",
-          truncateTo(String(model?.provider), inner - 11),
-          inner,
-          "muted",
-        ),
-      );
-    out.push(
-      this.field(
-        "THINKING",
-        liveCtx?.thinkingLevel ?? "off",
-        inner,
-        "muted",
-      ),
-    );
-    return out;
-  }
-
-  private telemetryRows(
-    inner: number,
-    compact: boolean,
-  ): string[] {
-    const th = this.theme;
-    const out = [this.sep(inner, "TELEMETRY")];
-    if (!compact) {
-      out.push(
-        this.frameLine(
-          ` ${th.fg("dim", "TURNS".padEnd(9))}${th.fg("text", String(state.turns))}`,
-          inner,
-        ),
-      );
-      out.push(
-        this.frameLine(
-          ` ${th.fg("dim", "TOKENS".padEnd(9))}${th.fg("success", "↑" + fmtTokens(tokens.input))} ${th.fg("warning", "↓" + fmtTokens(tokens.output))}`,
-          inner,
-        ),
-      );
-      if (tokens.cacheRead)
-        out.push(
-          this.field(
-            "CACHE",
-            fmtTokens(tokens.cacheRead),
-            inner,
-            "muted",
-          ),
-        );
-      if (tokens.cost)
-        out.push(
-          this.field(
-            "API COST",
-            `$${tokens.cost.toFixed(3)}`,
-            inner,
-            "muted",
-          ),
-        );
-    }
-
-    // SYNC: the tool success rate
-    const sync = syncPercent();
-    out.push(
-      this.frameLine(
-        sync === null
-          ? ` ${th.fg("dim", "SYNC".padEnd(9))}${th.fg("dim", "— no tools")}`
-          : ` ${th.fg("dim", "SYNC".padEnd(9))}${bar(th, Math.round(sync / 10), 10, syncTone(sync))} ${th.fg(syncTone(sync), `${sync.toFixed(0)}%`)}`,
-        inner,
-      ),
-    );
-
-    // TOOLS
-    out.push(
-      this.frameLine(
-        ` ${th.fg("dim", "TOOLS".padEnd(9))}${th.fg("success", `✓${state.toolOk}`)}${th.fg("dim", " Success ")}${th.fg(state.toolFail ? "error" : "dim", `✗${state.toolFail}`)}${th.fg("dim", " Failed")}`,
-        inner,
-      ),
-    );
-
-    // WINDOW: the context window
-    const usage = contextUsage();
-    const percent = usage?.percent ?? 0;
-    const liveMark = usage?.live
-      ? th.fg("accent", " ▲ live")
-      : "";
-    if (!compact && usage?.contextWindow) {
-      out.push(
-        this.field(
-          "CONTEXT",
-          `${usage.tokens == null ? "?" : fmtTokens(usage.tokens)} / ${fmtTokens(usage.contextWindow)}`,
-          inner,
-          "muted",
-        ),
-      );
-    }
-    out.push(
-      this.frameLine(
-        ` ${th.fg("dim", "WINDOW".padEnd(9))}${bar(th, Math.round(percent / 10), 10, usageTone(percent))} ${th.fg(usageTone(percent), `${percent.toFixed(0)}%`)}${liveMark}`,
-        inner,
-      ),
-    );
-    // HYGIENE: tokens pruned from what the model sees, ✂ = thinking cut
-    if (!compact && (state.pruned || state.thinkCuts)) {
-      const cuts = state.thinkCuts
-        ? ` ✂${state.thinkCuts}`
-        : "";
-      out.push(
-        this.field(
-          "HYGIENE",
-          `-${fmtTokens(state.pruned)}${cuts}`,
-          inner,
-          state.thinkCuts ? "warning" : "muted",
-        ),
-      );
-    }
-    return out;
-  }
-
-  private performanceRows(
-    inner: number,
-    compact: boolean,
-  ): string[] {
-    const th = this.theme;
-    const out = [this.sep(inner, "PERFORMANCE")];
-    const active = perf.start > 0;
-    const outputLive = active && perf.chars > 0;
-    const now = Date.now();
-    const promptLive =
-      live.promptPps > 0 &&
-      live.at > 0 &&
-      now - live.at < LIVE_STALE_MS;
-    const upstreamTpsFresh =
-      upstreamMetrics.tps > 0 &&
-      upstreamMetrics.tpsAt > 0 &&
-      now - upstreamMetrics.tpsAt < SERVER_RATE_STALE_MS;
-    const swapTpsFresh =
-      swap.srvTps > 0 &&
-      swap.srvTpsAt > 0 &&
-      now - swap.srvTpsAt < SERVER_RATE_STALE_MS;
-    const serverTpsFresh =
-      upstreamTpsFresh || swapTpsFresh;
-    const serverTps = upstreamTpsFresh
-      ? upstreamMetrics.tps
-      : swap.srvTps;
-    const requestTpsFresh =
-      active &&
-      upstreamTpsFresh &&
-      upstreamMetrics.tpsAt >= perf.start;
-    let tps = perf.tps;
-    if (requestTpsFresh) tps = upstreamMetrics.tps;
-    else if (active) tps = outputLive ? liveTps() : 0;
-    else if (serverTpsFresh) tps = serverTps;
-    const tpsTone: ThemeColor =
-      requestTpsFresh || !outputLive
-        ? "success"
-        : "accent";
-    let tpsSuffix = "";
-    if (requestTpsFresh)
-      tpsSuffix = th.fg("dim", " server");
-    else if (outputLive)
-      tpsSuffix = th.fg("dim", " ~live");
-    else if (active) tpsSuffix = "";
-    else if (serverTpsFresh)
-      tpsSuffix = th.fg("dim", " server");
-    out.push(
-      this.frameLine(
-        ` ${th.fg("dim", "TOK/S".padEnd(9))}${th.fg(tpsTone, tps ? tps.toFixed(1) : "—")}${tpsSuffix}`,
-        inner,
-      ),
-    );
-    const upstreamPpsFresh =
-      upstreamMetrics.promptPps > 0 &&
-      upstreamMetrics.promptPpsAt > 0 &&
-      now - upstreamMetrics.promptPpsAt < SERVER_RATE_STALE_MS;
-    const swapPpsFresh =
-      swap.srvPps > 0 &&
-      swap.srvPpsAt > 0 &&
-      now - swap.srvPpsAt < SERVER_RATE_STALE_MS;
-    const serverPpsFresh =
-      upstreamPpsFresh || swapPpsFresh;
-    const serverPps = upstreamPpsFresh
-      ? upstreamMetrics.promptPps
-      : swap.srvPps;
-    const requestPpsFresh =
-      active &&
-      upstreamPpsFresh &&
-      upstreamMetrics.promptPpsAt >= perf.start;
-    let pps = perf.pps;
-    let ppsSuffix = " ~est";
-    if (promptLive) {
-      pps = live.promptPps;
-      ppsSuffix = live.promptPpsServer
-        ? " server"
-        : " ~live";
-    } else if (requestPpsFresh) {
-      pps = upstreamMetrics.promptPps;
-      ppsSuffix = " server";
-    } else if (active) {
-      pps = 0;
-      ppsSuffix = "";
-    } else if (serverPpsFresh) {
-      pps = serverPps;
-      ppsSuffix = "";
-    }
-    let ppsDisplay = "—";
-    if (pps)
-      ppsDisplay = `${pps.toFixed(1)}${ppsSuffix}`;
-    out.push(
-      this.field(
-        "PROMPT/S",
-        ppsDisplay,
-        inner,
-        "muted",
-      ),
-    );
-    if (active && live.promptProcessed > 0) {
-      if (
-        live.promptProgressKnown &&
-        live.promptTotal > 0
+        !cache ||
+        cache.inner !== inner ||
+        cache.compact !== ui.compact ||
+        now - cache.at > 500
       ) {
-        const progress = Math.min(
-          1,
-          Math.max(
-            0,
-            live.promptProcessed / live.promptTotal,
-          ),
-        );
-        const percent = Math.round(progress * 100);
-        const estimateMark =
-          live.promptTotalEstimated ? "~" : "";
-        out.push(
-          this.field(
-            "PROGRESS",
-            `${bar(th, Math.round(progress * 10), 10, "accent")} ${estimateMark}${percent}% ${fmtTokens(live.promptProcessed)}/${fmtTokens(live.promptTotal)}`,
-            inner,
-            "muted",
-          ),
-        );
-      } else {
-        out.push(
-          this.field(
-            "PROGRESS",
-            `${fmtTokens(live.promptProcessed)} processed`,
-            inner,
-            "muted",
-          ),
-        );
+        const compact = ui.compact;
+        cache = {
+          at: now,
+          inner,
+          compact,
+          lines: [
+            ...sessionRows(panel, inner, compact),
+            ...telemetryRows(panel, inner, compact),
+            ...performanceRows(panel, inner, compact),
+            ...swapRows(panel, inner, compact),
+          ],
+        };
       }
-    }
-    if (compact) return out;
-    const promptTotal = swap.cacheTokens + swap.inputTokens;
-    if (swap.kvKnown && promptTotal) {
-      const hit = Math.round(
-        (swap.cacheTokens / promptTotal) * 100,
+      const bottom = panel.theme.fg(
+        "border",
+        "└" + "─".repeat(inner) + "┘",
       );
-      out.push(
-        this.field(
-          "KV CACHE",
-          `${fmtTokens(swap.cacheTokens)}/${fmtTokens(promptTotal)} hit ${hit}%`,
-          inner,
-          "muted",
-        ),
+      const lines = [
+        ...statusSection(panel, inner),
+        ...locationRows(panel, inner),
+        ...cache.lines,
+        ...extensionRows(panel, inner),
+        ...piLensRows(panel, inner),
+      ];
+      const target = (panel.fillHeight?.() ?? 0) - 1;
+      while (lines.length < target)
+        lines.push(panelFrame(panel, "", inner));
+      return [...lines, bottom].map((line) =>
+        truncateToWidth(line, width),
       );
-    }
-    out.push(
-      this.field(
-        "PEAK",
-        perf.peakTps
-          ? `${perf.peakTps.toFixed(1)} tok/s`
-          : "—",
-        inner,
-        "muted",
-      ),
-    );
-    out.push(
-      this.field(
-        "TTFT",
-        perf.ttft ? fmtMs(perf.ttft) : "—",
-        inner,
-        "muted",
-      ),
-    );
-    out.push(
-      this.field(
-        "DURATION",
-        perf.start
-          ? fmtMs(Math.max(1, Date.now() - perf.start))
-          : perf.lastMs
-            ? fmtMs(perf.lastMs)
-            : "—",
-        inner,
-        "muted",
-      ),
-    );
-    const up = Math.floor(
-      (Date.now() - sessionStart) / 60000,
-    );
-    out.push(
-      this.field(
-        "UPTIME",
-        `${Math.floor(up / 60)}h ${String(up % 60).padStart(2, "0")}m`,
-        inner,
-        "muted",
-      ),
-    );
-    return out;
-  }
-
-  private costRow(inner: number): string {
-    if (!swap.gpus.length)
-      return this.field("COST", "—", inner, "muted");
-    const kwhPrice = ui.kwhPrice;
-    if (kwhPrice === undefined)
-      return this.field(
-        "COST",
-        "→ /sidepanel cost",
-        inner,
-        "dim",
-      );
-    const fmtMoney = (wh: number) => {
-      const price = (wh / 1000) * kwhPrice;
-      return ui.currency === "USD"
-        ? `$${price.toFixed(3)}`
-        : `${price.toFixed(3)} €`;
-    };
-    return this.field(
-      "COST",
-      fmtMoney(totalWh()) +
-        this.theme.fg(
-          "dim",
-          ` (ses ${fmtMoney(swap.energyWh)})`,
-        ),
-      inner,
-      "warning",
-    );
-  }
-
-  private swapRows(
-    inner: number,
-    compact: boolean,
-  ): string[] {
-    if (!swap.base) return [];
-    const th = this.theme;
-    const section =
-      swap.kind === "ninfer" ? "NINFER" : "LLAMA-SWAP";
-    const out = [this.sep(inner, section)];
-    let st: string;
-    if (swap.state === "ready")
-      st = th.fg("success", "IN VRAM");
-    else if (swap.state === "asleep")
-      st = th.fg("muted", "ASLEEP");
-    else if (swap.state === "error")
-      st = th.fg("error", "OFFLINE");
-    else if (swap.state === "loading")
-      st = th.fg(
-        "warning",
-        `LOADING ${secsSince(swap.since)}s`,
-      );
-    else st = th.fg("warning", "CHECKING");
-    const load =
-      swap.state === "ready" && swap.loadMs
-        ? th.fg("dim", ` load ${fmtMs(swap.loadMs)}`)
-        : "";
-    out.push(
-      this.frameLine(
-        ` ${th.fg("dim", "STATUS".padEnd(9))}${st}${load}`,
-        inner,
-      ),
-    );
-    if (compact) return [...out, this.costRow(inner)];
-    if (swap.state === "error")
-      out.push(
-        this.frameLine(
-          " " + th.fg("error", swap.error),
-          inner,
-        ),
-      );
-    const gib = (n: number) => n / 2 ** 30;
-    for (const [i, g] of swap.gpus.entries()) {
-      const pct = g.memTotal
-        ? (g.memUsed / g.memTotal) * 100
-        : 0;
-      out.push(
-        this.frameLine(
-          ` ${th.fg("dim", `VRAM${i}`.padEnd(9))}${bar(th, Math.round(pct / 10), 10, "accent")} ${th.fg("muted", `${gib(g.memUsed).toFixed(1)}/${Math.round(gib(g.memTotal))}G`)}`,
-          inner,
-        ),
-      );
-      out.push(
-        this.frameLine(
-          ` ${th.fg("dim", `GPU${i}`.padEnd(9))}${th.fg(g.util > 0 ? "accent" : "muted", `${Math.round(g.util)}%`.padEnd(6))}${th.fg(g.temp >= 80 ? "error" : "muted", `${Math.round(g.temp)}°C`.padEnd(7))}${th.fg("muted", `${Math.round(g.power)}W`)}`,
-          inner,
-        ),
-      );
-    }
-    if (swap.ramTotal)
-      out.push(
-        this.field(
-          "RAM",
-          `${gib(swap.ramUsed).toFixed(1)} / ${Math.round(gib(swap.ramTotal))}G`,
-          inner,
-          "muted",
-        ),
-      );
-    if (swap.gpus.length)
-      out.push(
-        this.field(
-          "ENERGY",
-          `${(totalWh() / 1000).toFixed(3)} kWh`,
-          inner,
-          "muted",
-        ),
-      );
-    out.push(this.costRow(inner));
-    return out;
-  }
-
-  render(width: number): string[] {
-    const inner = Math.max(24, width - 2);
-    const now = Date.now();
+    },
+  };
+  timer = setInterval(() => {
+    panel.frame++;
+    const cwd = displayPath(liveCtx?.cwd);
+    const cwdNeedsScroll =
+      visibleWidth(cwd) > panelWidth - 13;
     if (
-      !this.cache ||
-      this.cache.inner !== inner ||
-      this.cache.compact !== ui.compact ||
-      now - this.cache.at > 500
-    ) {
-      const c = ui.compact;
-      this.cache = {
-        at: now,
-        inner,
-        compact: c,
-        lines: [
-          ...this.sessionRows(inner, c),
-          ...this.telemetryRows(inner, c),
-          ...this.performanceRows(inner, c),
-          ...this.swapRows(inner, c),
-        ],
-      };
-    }
-    const bottom = this.theme.fg(
-      "border",
-      "└" + "─".repeat(inner) + "┘",
-    );
-    const lines = [
-      ...this.statusSection(inner),
-      ...this.locationRows(inner),
-      ...this.cache.lines,
-      ...this.extensionRows(inner),
-      ...this.piLensRows(inner),
-    ];
-    const target = (this.fillHeight?.() ?? 0) - 1;
-    while (lines.length < target)
-      lines.push(this.frameLine("", inner));
-    return [...lines, bottom].map((l) =>
-      truncateToWidth(l, width),
-    );
-  }
+      animating() ||
+      cwdNeedsScroll ||
+      panel.frame % 8 === 0
+    )
+      tui.requestRender();
+  }, 125);
+  return panel;
 }
 
 /* ──────────────────────────────────────────────────────── config ── */
@@ -2397,14 +2342,13 @@ const SIDE_PANEL_CONFIG_PATH = join(
 
 function loadSidepanelConfig(): SidepanelConfig {
   try {
-    const parsed: unknown = JSON.parse(
-      readFileSync(SIDE_PANEL_CONFIG_PATH, "utf8"),
+    const parsed = decodeWireValue(
+      JSON.parse(
+        readFileSync(SIDE_PANEL_CONFIG_PATH, "utf8"),
+      ) as WireValue,
     );
-    return parsed !== null &&
-      typeof parsed === "object" &&
-      !Array.isArray(parsed)
-      ? (parsed as SidepanelConfig)
-      : {};
+    const record = parsed && jsonObject(parsed);
+    return record ? (record as SidepanelConfig) : {};
   } catch {
     return {};
   }
@@ -2472,7 +2416,7 @@ function windowTitle(cwd: string, done = false): string {
 
 const showPanel = (theme: Theme) => {
   if (!tuiRef || panel || !panelEnabled) return;
-  panel = new SidepanelPanel(tuiRef, theme);
+  panel = createSidepanelPanel(tuiRef, theme);
 
   // SAFETY: tuiRef is a TUI instance; we access private layoutRoot/setLayoutRoot for fullscreen mode
   const t = tuiRef as unknown as {
@@ -2482,8 +2426,7 @@ const showPanel = (theme: Theme) => {
   };
   if (
     t.mode === "fullscreen" &&
-    t.layoutRoot &&
-    typeof t.setLayoutRoot === "function"
+    t.layoutRoot
   ) {
     panel.fillHeight = () => tuiRef?.terminal.rows ?? 0;
     wrappedRoot = t.layoutRoot;
@@ -2577,13 +2520,11 @@ async function discoverNinfer(
   pi: ExtensionAPI,
   cfg: SidepanelConfig["ninfer"],
 ): Promise<void> {
-  const urls = (Array.isArray(cfg?.urls) ? cfg.urls : []).filter(
-    (url): url is string =>
-      typeof url === "string" && url.trim().length > 0,
+  const urls = (cfg?.urls ?? []).filter(
+    (url) => url.trim().length > 0,
   );
   if (!urls.length) return;
-  const apiKey =
-    typeof cfg?.apiKey === "string" ? cfg.apiKey : "";
+  const apiKey = cfg?.apiKey ?? "";
   const headers: Record<string, string> = apiKey
     ? { Authorization: `Bearer ${apiKey}` }
     : {};
@@ -2652,6 +2593,341 @@ async function discoverNinfer(
     apiKey: apiKey || "ninfer",
     models,
   });
+}
+
+type AssistantStreamEvent =
+  MessageUpdateEvent["assistantMessageEvent"];
+
+function updateAssistantPhase(
+  event: AssistantStreamEvent,
+): void {
+  const type = event?.type;
+  if (type === "thinking_start" || type === "thinking_delta")
+    setPhase("thinking");
+  else if (type === "text_start" || type === "text_delta")
+    setPhase("responding");
+  else if (
+    type === "toolcall_start" ||
+    type === "toolcall_delta"
+  ) {
+    setPhase("tool");
+    const call = event.partial?.content?.[event.contentIndex];
+    if (call?.type === "toolCall") {
+      state.toolName = call.name ?? "";
+      state.toolTarget = toolTarget(call.arguments);
+    }
+  }
+}
+
+function updateAssistantTokenSamples(
+  event: AssistantStreamEvent,
+): void {
+  if (event && "delta" in event && event.delta) {
+    if (!perf.first) perf.first = Date.now();
+    perf.chars += event.delta.length;
+  }
+  if (event && "partial" in event) {
+    const usage = event.partial.usage;
+    const promptTokens =
+      usage.input + usage.cacheRead + usage.cacheWrite;
+    if (promptTokens > 0)
+      perf.livePromptTokens = promptTokens;
+    if (usage.output > 0)
+      perf.liveOutputTokens = usage.output;
+  }
+}
+
+function recordAssistantPerformance(
+  message: AssistantMessage,
+): void {
+  if (!perf.start) return;
+  const end = Date.now();
+  perf.lastMs =
+    message.durationMs ?? Math.max(1, end - perf.start);
+  const firstTokenMs = perf.first
+    ? Math.max(0, perf.first - perf.start)
+    : 0;
+  const responseMs = Math.max(1, perf.lastMs);
+  const promptTokens =
+    (message.usage?.input ?? 0) +
+    (message.usage?.cacheRead ?? 0) +
+    (message.usage?.cacheWrite ?? 0) ||
+    perf.livePromptTokens;
+  if (
+    promptTokens > 0 &&
+    firstTokenMs > 0 &&
+    firstTokenMs <= responseMs
+  ) {
+    const estimate =
+      promptTokens / (firstTokenMs / 1000);
+    if (
+      Number.isFinite(estimate) &&
+      estimate <= MAX_ESTIMATED_PROMPT_PPS
+    )
+      perf.pps = estimate;
+  }
+  const outputTokens =
+    message.usage?.output ||
+    perf.liveOutputTokens ||
+    perf.chars / 4;
+  const generationMs =
+    firstTokenMs > 0 && firstTokenMs < responseMs
+      ? responseMs - firstTokenMs
+      : responseMs;
+  if (outputTokens > 0 && generationMs > 0) {
+    perf.tps = outputTokens / (generationMs / 1000);
+    perf.peakTps = Math.max(perf.peakTps, perf.tps);
+  }
+  if (firstTokenMs > 0) perf.ttft = firstTokenMs;
+  perf.start = 0;
+}
+
+function refreshMetricsAfterMessage(): void {
+  setTimeout(() => {
+    const refreshes = [
+      refreshSwapMetrics(),
+      refreshUpstreamMetrics(),
+    ];
+    if (swap.kind === "llama-swap")
+      refreshes.push(refreshSwapActivity());
+    void Promise.all(refreshes).then(() => repaint());
+  }, 300);
+}
+
+function buildSwapStatusLines(
+  ctx: ExtensionContext,
+  rows: ActivityRow[],
+  total: number,
+): string[] {
+  const dim = (text: string) =>
+    ctx.ui.theme.fg("dim", text);
+  const mean = (values: number[]) =>
+    values.length
+      ? values.reduce((a, b) => a + b, 0) / values.length
+      : 0;
+  const ago = (iso: string) => {
+    const minutes = Math.max(
+      0,
+      Math.round((Date.now() - Date.parse(iso)) / 60000),
+    );
+    return minutes < 60
+      ? `${minutes}m ago`
+      : `${Math.floor(minutes / 60)}h ${minutes % 60}m ago`;
+  };
+  const lines = [
+    ctx.ui.theme.fg(
+      "accent",
+      ctx.ui.theme.bold("LLAMA-SWAP STATUS"),
+    ) + dim(` · last ${rows.length} of ${total} requests`),
+  ];
+  const byModel = new Map<string, ActivityRow[]>();
+  for (const row of rows) {
+    if (!row.model) continue;
+    byModel.set(row.model, [
+      ...(byModel.get(row.model) ?? []),
+      row,
+    ]);
+  }
+  for (const [model, modelRows] of byModel) {
+    const tokenRows = modelRows.map((row) => row.tokens ?? {});
+    const sum = (
+      selector: (tokens: ActivityTokens) => number,
+    ) =>
+      tokenRows.reduce(
+        (totalTokens, tokens) =>
+          totalTokens + Math.max(0, selector(tokens)),
+        0,
+      );
+    const errors = modelRows.filter(
+      (row) => (row.resp_status_code ?? 0) >= 400,
+    ).length;
+    const gen = mean(
+      tokenRows
+        .map((tokens) => tokens.tokens_per_second ?? 0)
+        .filter((value) => value > 0),
+    );
+    const prompt = mean(
+      tokenRows
+        .map((tokens) => tokens.prompt_per_second ?? 0)
+        .filter((value) => value > 0),
+    );
+    const cached = sum((tokens) => tokens.cache_tokens ?? 0);
+    const input = sum((tokens) => tokens.input_tokens ?? 0);
+    const output = sum((tokens) => tokens.output_tokens ?? 0);
+    const durations = modelRows
+      .map((row) =>
+        finiteNumber(row.duration_ms)
+          ? row.duration_ms
+          : Number.NaN,
+      )
+      .filter((duration) => Number.isFinite(duration))
+      .sort((a, b) => a - b);
+    const p95 = durations.length
+      ? (durations[
+          Math.min(
+            durations.length - 1,
+            Math.floor(durations.length * 0.95),
+          )
+        ] ?? 0)
+      : 0;
+    lines.push(
+      "",
+      ctx.ui.theme.fg("text", ctx.ui.theme.bold(model)),
+      dim("  requests ") +
+        ctx.ui.theme.fg("text", String(modelRows.length)) +
+        dim(" · errors ") +
+        ctx.ui.theme.fg(
+          errors ? "error" : "success",
+          String(errors),
+        ) +
+        dim(` · last ${ago(modelRows[0]?.timestamp ?? "")}`),
+      dim("  speed    ") +
+        ctx.ui.theme.fg("success", `gen ${gen.toFixed(1)} tok/s`) +
+        dim(" · ") +
+        ctx.ui.theme.fg("text", `prompt ${prompt.toFixed(1)} tok/s`),
+      dim("  tokens   ") +
+        ctx.ui.theme.fg(
+          "text",
+          `in ${fmtTokens(input)} · cached ${fmtTokens(cached)}`,
+        ) +
+        dim(
+          ` (hit ${cached + input ? Math.round((cached / (cached + input)) * 100) : 0}%)`,
+        ) +
+        ctx.ui.theme.fg("text", ` · out ${fmtTokens(output)}`),
+      dim("  duration ") +
+        ctx.ui.theme.fg(
+          "text",
+          `avg ${fmtMs(mean(durations))} · p95 ${fmtMs(p95)} · max ${fmtMs(durations.at(-1) ?? 0)}`,
+        ),
+    );
+  }
+  return lines;
+}
+
+async function showSwapStatus(
+  ctx: ExtensionContext,
+): Promise<void> {
+  if (swap.kind !== "llama-swap") {
+    ctx.ui.notify(
+      "/sidepanel status needs a llama-swap session model",
+      "warning",
+    );
+    return;
+  }
+  let report: ActivityReport;
+  try {
+    const response = await swapGet(
+      `/api/metrics/activity?limit=${ACTIVITY_REPORT_ROWS}`,
+      15000,
+    );
+    if (!response.ok)
+      throw new Error(`HTTP ${response.status}`);
+    report = (await response.json()) as typeof report;
+  } catch (error) {
+    ctx.ui.notify(
+      `llama-swap status failed: ${error instanceof Error ? error.message : String(error)}`,
+      "error",
+    );
+    return;
+  }
+  const rows = report.data ?? [];
+  if (!rows.length) {
+    ctx.ui.notify(
+      "llama-swap has no recorded requests yet",
+      "info",
+    );
+    return;
+  }
+  const lines = buildSwapStatusLines(
+    ctx,
+    rows,
+    report.total ?? rows.length,
+  );
+  await ctx.ui.custom<void>(
+    (
+      tui: TUI,
+      theme: Theme,
+      _keys: KeybindingsManager,
+      done: (result: void) => void,
+    ) => {
+      const inner = Math.max(
+        1,
+        Math.min(tui.terminal.columns - 2, 96),
+      );
+      const row = (text: string) => {
+        const value = truncateToWidth(` ${text}`, inner);
+        return (
+          theme.fg("accent", "│") +
+          value +
+          " ".repeat(Math.max(0, inner - visibleWidth(value))) +
+          theme.fg("accent", "│")
+        );
+      };
+      return {
+        render(width: number): string[] {
+          return [
+            `┌${"─".repeat(inner)}┐`,
+            ...lines.map(row),
+            `└${"─".repeat(inner)}┘`,
+            theme.fg("dim", " any key: close"),
+          ].map((line) => truncateToWidth(line, width));
+        },
+        handleInput(_data: string) {
+          done(undefined);
+        },
+        invalidate() {},
+      };
+    },
+  );
+}
+
+async function configureCost(
+  ctx: ExtensionContext,
+): Promise<void> {
+  const currency = await ctx.ui.select(
+    `Currency for COST (current: ${ui.currency})`,
+    ["EUR", "USD"],
+  );
+  if (!currency) return;
+  const current =
+    ui.kwhPrice === undefined
+      ? ""
+      : ` (current: ${ui.kwhPrice})`;
+  const raw = (
+    await ctx.ui.input(
+      `Electricity price per kWh in ${currency}${current}:`,
+      "0.30",
+    )
+  )?.trim();
+  if (raw === undefined) return;
+  const price =
+    raw === "" && ui.kwhPrice !== undefined
+      ? ui.kwhPrice
+      : Number(raw.replace(",", "."));
+  if (raw === "" && ui.kwhPrice === undefined) {
+    ctx.ui.notify("No price entered: COST unchanged", "warning");
+    return;
+  }
+  if (!Number.isFinite(price) || price < 0) {
+    ctx.ui.notify(`Invalid price: "${raw}"`, "error");
+    return;
+  }
+  ui.currency = currency === "USD" ? "USD" : "EUR";
+  ui.kwhPrice = price;
+  const cfg = loadSidepanelConfig();
+  saveSidepanelConfig({
+    ...cfg,
+    ui: {
+      ...cfg.ui,
+      currency: ui.currency,
+      kwhPrice: price,
+    },
+  });
+  repaint();
+  ctx.ui.notify(
+    `COST: ${ui.currency === "USD" ? `$${price.toFixed(3)}` : `${price.toFixed(3)} €`} per kWh`,
+    "info",
+  );
 }
 
 export default async function (pi: ExtensionAPI) {
@@ -2732,10 +3008,18 @@ export default async function (pi: ExtensionAPI) {
     string,
     { name: string; target: string }
   >();
-  const onPiLensEvent = (data: unknown) => {
-    rememberPiLensEvent(data);
-    repaint();
-  };
+  type PiLensEventHandler = Parameters<
+    typeof pi.events.on
+  >[1];
+  const onPiLensEvent: PiLensEventHandler =
+    (...args) => {
+      const decoded = decodeWireValue(
+        args[0] as WireValue,
+      );
+      if (decoded !== undefined)
+        rememberPiLensEvent(decoded);
+      repaint();
+    };
   for (const channel of [
     "pilens:files:touched",
     "pilens:format:start",
@@ -2748,81 +3032,95 @@ export default async function (pi: ExtensionAPI) {
     pi.events.on(channel, onPiLensEvent);
   }
 
+  const resetSessionView = (
+    ctx: ExtensionContext,
+  ): void => {
+    resetSessionState();
+    panelEnabled = true;
+    titleDone = false;
+    runningTools.clear();
+    liveCtx = ctx;
+    piLensState.currentFile = "";
+    piLensState.languages.clear();
+    piLensState.files.clear();
+    recountSession(ctx);
+    state.hasSmartCompact = pi.getCommands().some(
+      (command: { name: string }) =>
+        command.name?.replace(/^\/?/, "") ===
+        "smart-compact",
+    );
+  };
+
+  const startSessionTimers = (
+    ctx: ExtensionContext,
+  ): void => {
+    applyChrome(ctx);
+    void probeModel(ctx)
+      .then(() => repaint())
+      .catch(() => undefined);
+    clearInterval(metricsTimer);
+    lastPoll = 0;
+    metricsTimer = setInterval(() => {
+      const now = Date.now();
+      if (
+        !animating(now) &&
+        now - lastPoll < IDLE_POLL_MS
+      )
+        return;
+      lastPoll = now;
+      void Promise.all([
+        refreshSwapMetrics(),
+        refreshUpstreamMetrics(),
+      ])
+        .then(() => refreshSwapRunning())
+        .then(repaint);
+    }, BUSY_POLL_MS);
+    clearInterval(liveTimer);
+    liveTimer = setInterval(() => {
+      if (perf.start > 0 || state.phase !== "idle")
+        void refreshLiveContext().then(repaint);
+    }, LIVE_POLL_MS);
+  };
+
+  const bindSessionUi = (
+    ctx: ExtensionContext,
+  ): void => {
+    unsubscribeInput?.();
+    unsubscribeInput = ctx.ui.onTerminalInput(() => {
+      if (titleDone) {
+        titleDone = false;
+        ctx.ui.setTitle(windowTitle(ctx.cwd));
+      }
+      if (swap.state === "asleep" && liveCtx)
+        void preloadModel(liveCtx);
+      return undefined;
+    });
+    clearInterval(titleTimer);
+    titleTimer = setInterval(() => {
+      const current = liveCtx;
+      if (panelEnabled && current?.mode === "tui")
+        current.ui.setTitle(
+          windowTitle(current.cwd, titleDone),
+        );
+    }, TITLE_REFRESH_MS);
+  };
+
   pi.on(
     "session_start",
-    async (
+    (
       _event: SessionStartEvent,
       ctx: ExtensionContext,
     ) => {
-      resetSessionState();
-      panelEnabled = true;
-      titleDone = false;
-      runningTools.clear();
-      liveCtx = ctx;
-      piLensState.currentFile = "";
-      piLensState.languages.clear();
-      piLensState.files.clear();
-      recountSession(ctx);
-      pi.getCommands().some((c: { name: string }) => {
-        if (
-          c.name?.replace(/^\/?/, "") === "smart-compact"
-        ) {
-          state.hasSmartCompact = true;
-          return true;
-        }
-        return false;
-      });
+      resetSessionView(ctx);
       if (ctx.mode !== "tui") return;
-      applyChrome(ctx);
-      void probeModel(ctx)
-        .then(() => repaint())
-        .catch(() => undefined);
-      clearInterval(metricsTimer);
-      lastPoll = 0;
-      metricsTimer = setInterval(() => {
-        const now = Date.now();
-        if (
-          !animating(now) &&
-          now - lastPoll < IDLE_POLL_MS
-        )
-          return;
-        lastPoll = now;
-        void Promise.all([
-          refreshSwapMetrics(),
-          refreshUpstreamMetrics(),
-        ])
-          .then(() => refreshSwapRunning())
-          .then(repaint);
-      }, BUSY_POLL_MS);
-      clearInterval(liveTimer);
-      liveTimer = setInterval(() => {
-        if (perf.start > 0 || state.phase !== "idle")
-          void refreshLiveContext().then(repaint);
-      }, LIVE_POLL_MS);
-      unsubscribeInput?.();
-      unsubscribeInput = ctx.ui.onTerminalInput(() => {
-        if (titleDone) {
-          titleDone = false;
-          ctx.ui.setTitle(windowTitle(ctx.cwd));
-        }
-        if (swap.state === "asleep" && liveCtx)
-          void preloadModel(liveCtx);
-        return undefined;
-      });
-      clearInterval(titleTimer);
-      titleTimer = setInterval(() => {
-        const current = liveCtx;
-        if (panelEnabled && current?.mode === "tui")
-          current.ui.setTitle(
-            windowTitle(current.cwd, titleDone),
-          );
-      }, TITLE_REFRESH_MS);
+      startSessionTimers(ctx);
+      bindSessionUi(ctx);
     },
   );
 
   pi.on(
     "session_tree",
-    async (
+    (
       _event: SessionTreeEvent,
       ctx: ExtensionContext,
     ) => {
@@ -2834,7 +3132,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on(
     "model_select",
-    async (
+    (
       event: ModelSelectEvent,
       ctx: ExtensionContext,
     ) => {
@@ -2848,7 +3146,7 @@ export default async function (pi: ExtensionAPI) {
     },
   );
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", () => {
     persistEnergy(true);
     clearInterval(metricsTimer);
     metricsTimer = undefined;
@@ -2864,13 +3162,13 @@ export default async function (pi: ExtensionAPI) {
     hidePanel();
   });
 
-  pi.on("agent_start", async () => {
+  pi.on("agent_start", () => {
     state.runStart = Date.now();
   });
 
   pi.on(
     "turn_start",
-    async (
+    (
       _event: TurnStartEvent,
       ctx: ExtensionContext,
     ) => {
@@ -2883,11 +3181,13 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on(
     "message_start",
-    async (event: MessageStartEvent) => {
+    (event: MessageStartEvent) => {
       if (event.message.role !== "assistant") return;
       perf.start = Date.now();
       perf.first = 0;
       perf.chars = 0;
+      perf.livePromptTokens = 0;
+      perf.liveOutputTokens = 0;
       perf.pps = 0;
       live.promptTokens = 0;
       live.promptAt = 0;
@@ -2902,92 +3202,29 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on(
     "message_update",
-    async (
+    (
       event: MessageUpdateEvent,
       ctx: ExtensionContext,
     ) => {
       liveCtx = ctx;
-      const e = event.assistantMessageEvent;
-      const t = e?.type;
-      if (t === "thinking_start" || t === "thinking_delta")
-        setPhase("thinking");
-      else if (t === "text_start" || t === "text_delta")
-        setPhase("responding");
-      else if (
-        t === "toolcall_start" ||
-        t === "toolcall_delta"
-      ) {
-        setPhase("tool");
-        const call = e.partial?.content?.[e.contentIndex];
-        if (call?.type === "toolCall") {
-          state.toolName = call.name ?? "";
-          state.toolTarget = toolTarget(call.arguments);
-        }
-      }
-      if (e && "delta" in e && e.delta) {
-        if (!perf.first) perf.first = Date.now();
-        perf.chars += e.delta.length;
-      }
+      const streamEvent = event.assistantMessageEvent;
+      updateAssistantPhase(streamEvent);
+      updateAssistantTokenSamples(streamEvent);
     },
   );
 
-  pi.on("message_end", async (event: MessageEndEvent) => {
+  pi.on("message_end", (event: MessageEndEvent) => {
     if (event.message.role !== "assistant") return;
-    const m = event.message as AssistantMessage;
-    countAssistant(m);
-    if (perf.start) {
-      const end = Date.now();
-      perf.lastMs = end - perf.start;
-      const firstTokenMs = perf.first
-        ? Math.max(0, perf.first - perf.start)
-        : 0;
-      const responseMs = Math.max(1, perf.lastMs);
-      const promptMs =
-        firstTokenMs >= MIN_PROMPT_SAMPLE_MS &&
-        firstTokenMs <= responseMs
-          ? firstTokenMs
-          : responseMs;
-      const promptTokens =
-        (m.usage?.input ?? 0) +
-        (m.usage?.cacheRead ?? 0) +
-        (m.usage?.cacheWrite ?? 0);
-      if (promptTokens > 0) {
-        const estimate =
-          promptTokens / (promptMs / 1000);
-        if (
-          Number.isFinite(estimate) &&
-          estimate <= MAX_ESTIMATED_PROMPT_PPS
-        )
-          perf.pps = estimate;
-      }
-
-      const out = m.usage?.output || perf.chars / 4;
-      const generationMs =
-        firstTokenMs > 0 && firstTokenMs < responseMs
-          ? responseMs - firstTokenMs
-          : responseMs;
-      if (out > 0 && generationMs > 0) {
-        perf.tps = out / (generationMs / 1000);
-        perf.peakTps = Math.max(perf.peakTps, perf.tps);
-      }
-      if (firstTokenMs > 0) perf.ttft = firstTokenMs;
-      perf.start = 0;
-    }
+    const message = event.message as AssistantMessage;
+    countAssistant(message);
+    recordAssistantPerformance(message);
     repaint();
-    setTimeout(() => {
-      const refreshes = [
-        refreshSwapMetrics(),
-        refreshUpstreamMetrics(),
-      ];
-      if (swap.kind === "llama-swap")
-        refreshes.push(refreshSwapActivity());
-      void Promise.all(refreshes).then(() => repaint());
-    }, 300);
+    refreshMetricsAfterMessage();
   });
 
   pi.on(
     "tool_execution_start",
-    async (
+    (
       event: ToolExecutionStartEvent,
       ctx: ExtensionContext,
     ) => {
@@ -3008,7 +3245,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on(
     "tool_execution_end",
-    async (event: ToolExecutionEndEvent) => {
+    (event: ToolExecutionEndEvent) => {
       const tool = runningTools.get(event.toolCallId);
       runningTools.delete(event.toolCallId);
       if (event.isError) {
@@ -3035,7 +3272,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on(
     "agent_settled",
-    async (
+    (
       _event: AgentSettledEvent,
       ctx: ExtensionContext,
     ) => {
@@ -3055,7 +3292,7 @@ export default async function (pi: ExtensionAPI) {
     },
   );
 
-  pi.on("session_before_compact", async () => {
+  pi.on("session_before_compact", () => {
     state.compacting = true;
     state.compactSince = Date.now();
     state.compactBy = state.hasSmartCompact
@@ -3066,7 +3303,7 @@ export default async function (pi: ExtensionAPI) {
 
   pi.on(
     "session_compact",
-    async (event: SessionCompactEvent) => {
+    (event: SessionCompactEvent) => {
       state.compacting = false;
       if (event.fromExtension) {
         state.compactBy = state.hasSmartCompact
@@ -3079,7 +3316,7 @@ export default async function (pi: ExtensionAPI) {
     },
   );
 
-  pi.on("session_compact_failed", async () => {
+  pi.on("session_compact_failed", () => {
     state.compacting = false;
     repaint();
   });
@@ -3173,213 +3410,7 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
       if (arg === "status") {
-        if (swap.kind !== "llama-swap") {
-          ctx.ui.notify(
-            "/sidepanel status needs a llama-swap session model",
-            "warning",
-          );
-          return;
-        }
-        let report: ActivityReport;
-        try {
-          const response = await swapGet(
-            `/api/metrics/activity?limit=${ACTIVITY_REPORT_ROWS}`,
-            15000,
-          );
-          if (!response.ok)
-            throw new Error(`HTTP ${response.status}`);
-          report = (await response.json()) as typeof report;
-        } catch (err) {
-          ctx.ui.notify(
-            `llama-swap status failed: ${err instanceof Error ? err.message : String(err)}`,
-            "error",
-          );
-          return;
-        }
-        const rows = report.data ?? [];
-        if (!rows.length) {
-          ctx.ui.notify(
-            "llama-swap has no recorded requests yet",
-            "info",
-          );
-          return;
-        }
-        const dim = (s: string) =>
-          ctx.ui.theme.fg("dim", s);
-        const mean = (xs: number[]) =>
-          xs.length
-            ? xs.reduce((a, b) => a + b, 0) / xs.length
-            : 0;
-        const ago = (iso: string) => {
-          const m = Math.max(
-            0,
-            Math.round(
-              (Date.now() - Date.parse(iso)) / 60000,
-            ),
-          );
-          return m < 60
-            ? `${m}m ago`
-            : `${Math.floor(m / 60)}h ${m % 60}m ago`;
-        };
-        const lines = [
-          ctx.ui.theme.fg(
-            "accent",
-            ctx.ui.theme.bold("LLAMA-SWAP STATUS"),
-          ) +
-            dim(
-              ` · last ${rows.length} of ${report.total ?? rows.length} requests`,
-            ),
-        ];
-        const byModel = new Map<string, ActivityRow[]>();
-        for (const row of rows) {
-          if (!row.model) continue;
-          byModel.set(row.model, [
-            ...(byModel.get(row.model) ?? []),
-            row,
-          ]);
-        }
-        for (const [model, rs] of byModel) {
-          const t = rs.map((row) => row.tokens ?? {});
-          const sum = (
-            selector: (tokens: ActivityTokens) => number,
-          ) =>
-            t.reduce(
-              (total, tokens) =>
-                total + Math.max(0, selector(tokens)),
-              0,
-            );
-          const errors = rs.filter(
-            (row) => (row.resp_status_code ?? 0) >= 400,
-          ).length;
-          const gen = mean(
-            t
-              .map(
-                (tokens) => tokens.tokens_per_second ?? 0,
-              )
-              .filter((value) => value > 0),
-          );
-          const prompt = mean(
-            t
-              .map(
-                (tokens) => tokens.prompt_per_second ?? 0,
-              )
-              .filter((value) => value > 0),
-          );
-          const cached = sum(
-            (tokens) => tokens.cache_tokens ?? 0,
-          );
-          const input = sum(
-            (tokens) => tokens.input_tokens ?? 0,
-          );
-          const durations = rs
-            .map((r) =>
-              typeof r.duration_ms === "number" &&
-              Number.isFinite(r.duration_ms)
-                ? r.duration_ms
-                : Number.NaN,
-            )
-            .filter((duration) => Number.isFinite(duration))
-            .sort((a, b) => a - b);
-          lines.push(
-            "",
-            ctx.ui.theme.fg(
-              "text",
-              ctx.ui.theme.bold(model),
-            ),
-          );
-          lines.push(
-            dim("  requests ") +
-              ctx.ui.theme.fg("text", String(rs.length)) +
-              dim(" · errors ") +
-              ctx.ui.theme.fg(
-                errors ? "error" : "success",
-                String(errors),
-              ) +
-              dim(` · last ${ago(rs[0]?.timestamp ?? "")}`),
-          );
-          lines.push(
-            dim("  speed    ") +
-              ctx.ui.theme.fg(
-                "success",
-                `gen ${gen.toFixed(1)} tok/s`,
-              ) +
-              dim(" · ") +
-              ctx.ui.theme.fg(
-                "text",
-                `prompt ${prompt.toFixed(1)} tok/s`,
-              ),
-          );
-          const output = sum(
-            (tokens) => tokens.output_tokens ?? 0,
-          );
-          lines.push(
-            dim("  tokens   ") +
-              ctx.ui.theme.fg(
-                "text",
-                `in ${fmtTokens(input)} · cached ${fmtTokens(cached)}`,
-              ) +
-              dim(
-                ` (hit ${cached + input ? Math.round((cached / (cached + input)) * 100) : 0}%)`,
-              ) +
-              ctx.ui.theme.fg(
-                "text",
-                ` · out ${fmtTokens(output)}`,
-              ),
-          );
-          const p95 = durations.length
-            ? (durations[
-                Math.min(
-                  durations.length - 1,
-                  Math.floor(durations.length * 0.95),
-                )
-              ] ?? 0)
-            : 0;
-          lines.push(
-            dim("  duration ") +
-              ctx.ui.theme.fg(
-                "text",
-                `avg ${fmtMs(mean(durations))} · p95 ${fmtMs(p95)} · max ${fmtMs(durations.at(-1) ?? 0)}`,
-              ),
-          );
-        }
-        await ctx.ui.custom<void>(
-          (
-            tui: TUI,
-            theme: Theme,
-            _keys: KeybindingsManager,
-            done: (result: void) => void,
-          ) => {
-            const inner = Math.max(
-              1,
-              Math.min(tui.terminal.columns - 2, 96),
-            );
-            const row = (s: string) => {
-              const t = truncateToWidth(` ${s}`, inner);
-              return (
-                theme.fg("accent", "│") +
-                t +
-                " ".repeat(
-                  Math.max(0, inner - visibleWidth(t)),
-                ) +
-                theme.fg("accent", "│")
-              );
-            };
-            return {
-              render(width: number): string[] {
-                return [
-                  `┌${"─".repeat(inner)}┐`,
-                  ...lines.map(row),
-                  `└${"─".repeat(inner)}┘`,
-                  theme.fg("dim", " any key: close"),
-                ].map((l) => truncateToWidth(l, width));
-              },
-              handleInput(_data: string) {
-                done(undefined);
-              },
-              invalidate() {},
-            };
-          },
-        );
+        await showSwapStatus(ctx);
         return;
       }
       if (arg === "off") {
@@ -3389,53 +3420,7 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
       if (arg === "cost") {
-        const currency = await ctx.ui.select(
-          `Currency for COST (current: ${ui.currency})`,
-          ["EUR", "USD"],
-        );
-        if (!currency) return;
-        const current =
-          ui.kwhPrice === undefined
-            ? ""
-            : ` (current: ${ui.kwhPrice})`;
-        const raw = (
-          await ctx.ui.input(
-            `Electricity price per kWh in ${currency}${current}:`,
-            "0.30",
-          )
-        )?.trim();
-        if (raw === undefined) return;
-        const price =
-          raw === "" && ui.kwhPrice !== undefined
-            ? ui.kwhPrice
-            : Number(raw.replace(",", "."));
-        if (raw === "" && ui.kwhPrice === undefined) {
-          ctx.ui.notify(
-            "No price entered: COST unchanged",
-            "warning",
-          );
-          return;
-        }
-        if (!Number.isFinite(price) || price < 0) {
-          ctx.ui.notify(`Invalid price: "${raw}"`, "error");
-          return;
-        }
-        ui.currency = currency === "USD" ? "USD" : "EUR";
-        ui.kwhPrice = price;
-        const cfg = loadSidepanelConfig();
-        saveSidepanelConfig({
-          ...cfg,
-          ui: {
-            ...cfg.ui,
-            currency: ui.currency,
-            kwhPrice: price,
-          },
-        });
-        repaint();
-        ctx.ui.notify(
-          `COST: ${ui.currency === "USD" ? `$${price.toFixed(3)}` : `${price.toFixed(3)} €`} per kWh`,
-          "info",
-        );
+        await configureCost(ctx);
         return;
       }
       return ctx.ui.notify(
