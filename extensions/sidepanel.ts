@@ -54,8 +54,8 @@ const MIN_PANEL_WIDTH = 28;
 const MAX_PANEL_WIDTH = 72;
 const FAIL_FLASH_MS = 2500;
 const ONLINE_MS = 3000;
-const LIVE_POLL_MS = 500;
-const LIVE_STALE_MS = 2000;
+const LIVE_POLL_MS = 3000;
+const LIVE_STALE_MS = 5000;
 const BUSY_POLL_MS = 3000;
 const IDLE_POLL_MS = 30000;
 const SERVER_RATE_STALE_MS = 120000;
@@ -551,11 +551,25 @@ const swap = {
   srvPpsAt: 0,
   cacheTokens: 0,
   inputTokens: 0,
+  kvKnown: false,
   energyWh: 0,
   diskWh: 0,
   savedWh: 0,
   lastSampleAt: 0,
   lastWatts: 0,
+};
+
+const upstreamMetrics = {
+  base: "",
+  modelId: "",
+  promptTokens: 0,
+  promptSeconds: 0,
+  outputTokens: 0,
+  outputSeconds: 0,
+  promptPps: 0,
+  promptPpsAt: 0,
+  tps: 0,
+  tpsAt: 0,
 };
 
 let swapConnectionVersion = 0;
@@ -607,6 +621,180 @@ function normalizeServiceBase(url: string): string {
   return url.replace(/\/+$/, "").replace(/\/v1$/, "");
 }
 
+function parsePrometheusSamples(
+  text: string,
+): Map<string, number> {
+  const samples = new Map<string, number>();
+  const pattern =
+    /^\\s*([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\\{[^}]*\\})?\\s+([-+0-9.eE]+)(?:\\s+\\d+)?\\s*$/;
+  for (const line of text.split("\\n")) {
+    if (line.startsWith("#")) continue;
+    const match = pattern.exec(line);
+    if (!match) continue;
+    const name = match[1];
+    const value = Number(match[2]);
+    if (!name || !Number.isFinite(value)) continue;
+    samples.set(name, (samples.get(name) ?? 0) + value);
+  }
+  return samples;
+}
+
+function metricValue(
+  samples: Map<string, number>,
+  names: string[],
+): number | undefined {
+  for (const name of names) {
+    const value = samples.get(name);
+    if (value !== undefined) return value;
+  }
+  for (const [name, value] of samples) {
+    if (names.some((suffix) => name.endsWith(suffix)))
+      return value;
+  }
+  return undefined;
+}
+
+function resetUpstreamMetrics(): void {
+  Object.assign(upstreamMetrics, {
+    base: "",
+    modelId: "",
+    promptTokens: 0,
+    promptSeconds: 0,
+    outputTokens: 0,
+    outputSeconds: 0,
+    promptPps: 0,
+    promptPpsAt: 0,
+    tps: 0,
+    tpsAt: 0,
+  });
+}
+
+function parseUpstreamMetrics(
+  text: string,
+  base: string,
+  modelId: string,
+): void {
+  const samples = parsePrometheusSamples(text);
+  const promptTokens = metricValue(samples, [
+    "llamacpp:prompt_tokens_total",
+    "prompt_tokens_total",
+  ]);
+  const promptSeconds = metricValue(samples, [
+    "llamacpp:prompt_seconds_total",
+    "prompt_seconds_total",
+  ]);
+  const outputTokens = metricValue(samples, [
+    "llamacpp:tokens_predicted_total",
+    "tokens_predicted_total",
+  ]);
+  const outputSeconds = metricValue(samples, [
+    "llamacpp:tokens_predicted_seconds_total",
+    "tokens_predicted_seconds_total",
+  ]);
+  const directPps = metricValue(samples, [
+    "llamacpp:prompt_tokens_seconds",
+    "llamacpp:prompt_per_second",
+    "prompt_tokens_seconds",
+    "prompt_per_second",
+    "prompt_tokens_per_second",
+  ]);
+  const directTps = metricValue(samples, [
+    "llamacpp:predicted_tokens_seconds",
+    "llamacpp:tokens_per_second",
+    "predicted_tokens_seconds",
+    "tokens_per_second",
+    "predicted_per_second",
+  ]);
+  const baselineReady =
+    upstreamMetrics.base === base &&
+    upstreamMetrics.modelId === modelId;
+  if (!baselineReady) {
+    resetUpstreamMetrics();
+    upstreamMetrics.base = base;
+    upstreamMetrics.modelId = modelId;
+  }
+  const now = Date.now();
+  if (
+    typeof directPps === "number" &&
+    Number.isFinite(directPps) &&
+    directPps > 0
+  ) {
+    upstreamMetrics.promptPps = directPps;
+    upstreamMetrics.promptPpsAt = now;
+  } else if (
+    baselineReady &&
+    promptTokens !== undefined &&
+    promptSeconds !== undefined &&
+    promptTokens >= upstreamMetrics.promptTokens &&
+    promptSeconds > upstreamMetrics.promptSeconds
+  ) {
+    const tokenDelta = promptTokens - upstreamMetrics.promptTokens;
+    const secondsDelta =
+      promptSeconds - upstreamMetrics.promptSeconds;
+    if (tokenDelta > 0 && secondsDelta > 0) {
+      upstreamMetrics.promptPps = tokenDelta / secondsDelta;
+      upstreamMetrics.promptPpsAt = now;
+    }
+  }
+  if (
+    typeof directTps === "number" &&
+    Number.isFinite(directTps) &&
+    directTps > 0
+  ) {
+    upstreamMetrics.tps = directTps;
+    upstreamMetrics.tpsAt = now;
+  } else if (
+    baselineReady &&
+    outputTokens !== undefined &&
+    outputSeconds !== undefined &&
+    outputTokens >= upstreamMetrics.outputTokens &&
+    outputSeconds > upstreamMetrics.outputSeconds
+  ) {
+    const tokenDelta = outputTokens - upstreamMetrics.outputTokens;
+    const secondsDelta =
+      outputSeconds - upstreamMetrics.outputSeconds;
+    if (tokenDelta > 0 && secondsDelta > 0) {
+      upstreamMetrics.tps = tokenDelta / secondsDelta;
+      upstreamMetrics.tpsAt = now;
+    }
+  }
+  if (promptTokens !== undefined)
+    upstreamMetrics.promptTokens = promptTokens;
+  if (promptSeconds !== undefined)
+    upstreamMetrics.promptSeconds = promptSeconds;
+  if (outputTokens !== undefined)
+    upstreamMetrics.outputTokens = outputTokens;
+  if (outputSeconds !== undefined)
+    upstreamMetrics.outputSeconds = outputSeconds;
+}
+
+async function refreshUpstreamMetrics(): Promise<void> {
+  if (swap.kind !== "llama-swap") return;
+  const version = swapConnectionVersion;
+  const modelId = swap.modelId;
+  const realId = swap.realId;
+  const base = swap.base;
+  const headers = { ...swap.headers };
+  if (!base || !realId) return;
+  try {
+    const response = await swapFetch(
+      base,
+      headers,
+      `/upstream/${encodeURIComponent(realId)}/metrics?model=${encodeURIComponent(realId)}`,
+    );
+    if (!response.ok) return;
+    const text = await response.text();
+    if (
+      !isCurrentSwap(version, modelId, base) ||
+      swap.realId !== realId
+    )
+      return;
+    parseUpstreamMetrics(text, base, realId);
+  } catch {
+    // model metrics are optional
+  }
+}
+
 function parseSwapMetrics(text: string): void {
   const gpus = new Map<string, GpuStat>();
   let ramUsed = 0;
@@ -615,6 +803,8 @@ function parseSwapMetrics(text: string): void {
   let srvPps = 0;
   let cacheTokens = 0;
   let promptTokens = 0;
+  let hasCacheTokens = false;
+  let hasPromptTokens = false;
 
   for (const line of text.split("\n")) {
     const m =
@@ -649,13 +839,16 @@ function parseSwapMetrics(text: string): void {
     else if (
       key === "last_cache_tokens" &&
       metricMatchesModel
-    )
+    ) {
       cacheTokens = Math.max(0, value);
-    else if (
+      hasCacheTokens = true;
+    } else if (
       key === "last_prompt_tokens" &&
       metricMatchesModel
-    )
+    ) {
       promptTokens = Math.max(0, value);
+      hasPromptTokens = true;
+    }
     if (!key.startsWith("gpu_")) continue;
     const id = /id="([^"]*)"/.exec(labels)?.[1] ?? "0";
     const gpu = gpus.get(id) ?? {
@@ -690,8 +883,18 @@ function parseSwapMetrics(text: string): void {
     swap.srvPps = srvPps;
     swap.srvPpsAt = Date.now();
   }
-  swap.cacheTokens = cacheTokens;
-  swap.inputTokens = Math.max(0, promptTokens - cacheTokens);
+  if (hasCacheTokens || hasPromptTokens) {
+    const nextCache = hasCacheTokens
+      ? cacheTokens
+      : swap.cacheTokens;
+    swap.cacheTokens = nextCache;
+    if (hasPromptTokens)
+      swap.inputTokens = Math.max(
+        0,
+        promptTokens - nextCache,
+      );
+    swap.kvKnown = true;
+  }
   swap.gpus = [...gpus.entries()]
     .sort(([a], [b]) => Number(a) - Number(b))
     .map(([, g]) => g);
@@ -860,14 +1063,22 @@ async function refreshSwapActivity(): Promise<void> {
     )[0];
     const latest = latestRow?.tokens;
     if (!latest) return;
-    swap.cacheTokens = Math.max(
-      0,
-      latest.cache_tokens ?? 0,
-    );
-    swap.inputTokens = Math.max(
-      0,
-      latest.input_tokens ?? 0,
-    );
+    let updated = false;
+    if (typeof latest.cache_tokens === "number") {
+      swap.cacheTokens = Math.max(
+        0,
+        latest.cache_tokens,
+      );
+      updated = true;
+    }
+    if (typeof latest.input_tokens === "number") {
+      swap.inputTokens = Math.max(
+        0,
+        latest.input_tokens,
+      );
+      updated = true;
+    }
+    if (updated) swap.kvKnown = true;
   } catch {
     // metrics are optional
   }
@@ -875,14 +1086,34 @@ async function refreshSwapActivity(): Promise<void> {
 
 /* ── live context ── */
 
+interface SwapSlotTimings {
+  prompt_n?: number;
+  prompt_ms?: number;
+  prompt_per_second?: number;
+}
+
 interface SwapSlot {
   is_processing?: boolean;
   n_prompt_tokens?: number;
+  n_prompt_tokens_processed?: number;
+  n_prompt_tokens_cache?: number;
+  timings?: SwapSlotTimings;
 }
 
-const live = { tokens: 0, at: 0 };
+const live = {
+  tokens: 0,
+  at: 0,
+  promptTokens: 0,
+  promptAt: 0,
+  promptPps: 0,
+  promptPpsServer: false,
+  promptTotal: 0,
+  promptProcessed: 0,
+  promptProgressKnown: false,
+};
 
 function resetSwapObservation(): void {
+  resetUpstreamMetrics();
   swap.gpus = [];
   swap.ramUsed = 0;
   swap.ramTotal = 0;
@@ -892,11 +1123,19 @@ function resetSwapObservation(): void {
   swap.srvPpsAt = 0;
   swap.cacheTokens = 0;
   swap.inputTokens = 0;
+  swap.kvKnown = false;
   swap.loadMs = 0;
   swap.lastSampleAt = 0;
   swap.lastWatts = 0;
   live.tokens = 0;
   live.at = 0;
+  live.promptTokens = 0;
+  live.promptAt = 0;
+  live.promptPps = 0;
+  live.promptPpsServer = false;
+  live.promptTotal = 0;
+  live.promptProcessed = 0;
+  live.promptProgressKnown = false;
 }
 
 function resetSessionState(): void {
@@ -948,24 +1187,113 @@ async function refreshLiveContext(): Promise<void> {
     const response = await swapFetch(
       base,
       headers,
-      `/upstream/${encodeURIComponent(realId)}/slots`,
+      `/upstream/${encodeURIComponent(realId)}/slots?model=${encodeURIComponent(realId)}`,
       1500,
     );
     if (!response.ok) return;
     const slots = (await response.json()) as SwapSlot[];
     if (!isCurrentSwap(version, modelId, base)) return;
-    const busy = slots.filter(
-      (slot): slot is Required<SwapSlot> =>
-        slot.is_processing === true &&
-        typeof slot.n_prompt_tokens === "number" &&
-        Number.isFinite(slot.n_prompt_tokens) &&
-        slot.n_prompt_tokens > 0,
-    );
+    const busy = slots.filter((slot) => {
+      if (slot.is_processing !== true) return false;
+      const processed = slot.n_prompt_tokens_processed;
+      const total = slot.n_prompt_tokens;
+      return (
+        (typeof processed === "number" &&
+          Number.isFinite(processed) &&
+          processed > 0) ||
+        (typeof total === "number" &&
+          Number.isFinite(total) &&
+          total > 0)
+      );
+    });
     if (!busy.length) return;
-    live.tokens = Math.max(
-      ...busy.map((s) => s.n_prompt_tokens),
+    const progressOf = (slot: SwapSlot): number =>
+      typeof slot.n_prompt_tokens_processed === "number" &&
+      Number.isFinite(slot.n_prompt_tokens_processed)
+        ? slot.n_prompt_tokens_processed
+        : slot.n_prompt_tokens ?? 0;
+    const now = Date.now();
+    const activeSlot = busy.reduce((best, slot) =>
+      progressOf(slot) > progressOf(best) ? slot : best,
     );
-    live.at = Date.now();
+    const promptTokens = progressOf(activeSlot);
+    const promptTotal =
+      typeof activeSlot.n_prompt_tokens === "number"
+        ? activeSlot.n_prompt_tokens
+        : promptTokens;
+    const promptProgressKnown =
+      typeof activeSlot.n_prompt_tokens_processed === "number";
+    live.promptTotal = promptTotal;
+    live.promptProcessed = Math.min(
+      promptTotal,
+      promptTokens,
+    );
+    live.promptProgressKnown = promptProgressKnown;
+    if (
+      typeof activeSlot.n_prompt_tokens === "number" &&
+      typeof activeSlot.n_prompt_tokens_cache === "number"
+    ) {
+      swap.cacheTokens = Math.max(
+        0,
+        activeSlot.n_prompt_tokens_cache,
+      );
+      swap.inputTokens = Math.max(
+        0,
+        activeSlot.n_prompt_tokens -
+          activeSlot.n_prompt_tokens_cache,
+      );
+      swap.kvKnown = true;
+    }
+    const serverPps = activeSlot.timings?.prompt_per_second;
+    const timingPromptN = activeSlot.timings?.prompt_n;
+    const timingPromptMs = activeSlot.timings?.prompt_ms;
+    if (!perf.first) {
+      if (
+        typeof serverPps === "number" &&
+        Number.isFinite(serverPps) &&
+        serverPps > 0
+      ) {
+        live.promptPps = serverPps;
+        live.promptPpsServer = true;
+      } else if (
+        typeof timingPromptN === "number" &&
+        typeof timingPromptMs === "number" &&
+        timingPromptN > 0 &&
+        timingPromptMs > 0
+      ) {
+        live.promptPps =
+          timingPromptN / (timingPromptMs / 1000);
+        live.promptPpsServer = true;
+      } else if (
+        live.promptAt &&
+        promptTokens < live.promptTokens
+      ) {
+        // A new slot/request reset its processed-token counter.
+        live.promptPps = 0;
+        live.promptPpsServer = false;
+      } else {
+        // The slot exposes cumulative processed tokens, not elapsed timing.
+        // Use the request start as the denominator; using the delta between
+        // polls incorrectly turns a 2,048-token batch into ~680 tok/s.
+        const elapsed = perf.start
+          ? (now - perf.start) / 1000
+          : 0;
+        if (
+          elapsed >= MIN_PROMPT_SAMPLE_MS / 1000 &&
+          promptTokens > 0
+        ) {
+          live.promptPps = promptTokens / elapsed;
+          live.promptPpsServer = false;
+        }
+      }
+      live.promptTokens = promptTokens;
+      live.promptAt = now;
+    }
+    live.tokens =
+      typeof activeSlot.n_prompt_tokens === "number"
+        ? activeSlot.n_prompt_tokens
+        : promptTokens;
+    live.at = now;
   } catch {
     // the pi estimate stays
   }
@@ -1067,6 +1395,7 @@ async function connectSwap(
   swap.base = base;
   swap.headers = headers;
   void refreshSwapMetrics();
+  void refreshUpstreamMetrics();
   void refreshSwapActivity();
   if (swap.kind === "ninfer") return true;
   // Use a snapshot: another model can be selected while the alias request is in flight.
@@ -1212,8 +1541,10 @@ async function preloadModel(
       );
   } finally {
     clearTimeout(slow);
-    if (isCurrentSwap(version, id, base))
+    if (isCurrentSwap(version, id, base)) {
       void refreshSwapMetrics();
+      void refreshUpstreamMetrics();
+    }
   }
 }
 
@@ -1432,33 +1763,11 @@ class SidepanelPanel implements Component {
     );
     if (!statuses.length) return [];
     const out = [this.sep(inner, "EXTENSIONS")];
-    for (const [key, value] of statuses) {
-      const label = key.toUpperCase();
-      const labelWidth = Math.min(
-        visibleWidth(label),
-        Math.max(1, inner - 4),
-      );
-      const labelText =
-        visibleWidth(label) > labelWidth
-          ? truncateToWidth(label, labelWidth, "…")
-          : label;
-      const valueWidth = Math.max(
-        1,
-        inner - labelWidth - 2,
-      );
-      // Match the leading space and separator used on the first line.
-      const continuation = " ".repeat(labelWidth + 2);
+    const valueWidth = Math.max(1, inner - 1);
+    for (const [, value] of statuses) {
       const wrapped = wrapTextWithAnsi(value, valueWidth);
-      for (const [index, line] of wrapped.entries()) {
-        out.push(
-          this.frameLine(
-            index === 0
-              ? ` ${this.theme.fg("dim", labelText)} ${line}`
-              : `${continuation}${line}`,
-            inner,
-          ),
-        );
-      }
+      for (const line of wrapped)
+        out.push(this.frameLine(` ${line}`, inner));
     }
     return out;
   }
@@ -1719,17 +2028,44 @@ class SidepanelPanel implements Component {
   ): string[] {
     const th = this.theme;
     const out = [this.sep(inner, "PERFORMANCE")];
-    const live = state.phase !== "idle" && perf.chars > 0;
-    const serverTpsFresh =
+    const active = perf.start > 0;
+    const outputLive = active && perf.chars > 0;
+    const now = Date.now();
+    const promptLive =
+      live.promptPps > 0 &&
+      live.at > 0 &&
+      now - live.at < LIVE_STALE_MS;
+    const upstreamTpsFresh =
+      upstreamMetrics.tps > 0 &&
+      upstreamMetrics.tpsAt > 0 &&
+      now - upstreamMetrics.tpsAt < SERVER_RATE_STALE_MS;
+    const swapTpsFresh =
       swap.srvTps > 0 &&
       swap.srvTpsAt > 0 &&
-      Date.now() - swap.srvTpsAt < SERVER_RATE_STALE_MS;
+      now - swap.srvTpsAt < SERVER_RATE_STALE_MS;
+    const serverTpsFresh =
+      upstreamTpsFresh || swapTpsFresh;
+    const serverTps = upstreamTpsFresh
+      ? upstreamMetrics.tps
+      : swap.srvTps;
+    const requestTpsFresh =
+      active &&
+      upstreamTpsFresh &&
+      upstreamMetrics.tpsAt >= perf.start;
     let tps = perf.tps;
-    if (live) tps = liveTps();
-    else if (serverTpsFresh) tps = swap.srvTps;
-    const tpsTone: ThemeColor = live ? "accent" : "success";
+    if (requestTpsFresh) tps = upstreamMetrics.tps;
+    else if (active) tps = outputLive ? liveTps() : 0;
+    else if (serverTpsFresh) tps = serverTps;
+    const tpsTone: ThemeColor =
+      requestTpsFresh || !outputLive
+        ? "success"
+        : "accent";
     let tpsSuffix = "";
-    if (live) tpsSuffix = th.fg("dim", " ~live");
+    if (requestTpsFresh)
+      tpsSuffix = th.fg("dim", " server");
+    else if (outputLive)
+      tpsSuffix = th.fg("dim", " ~live");
+    else if (active) tpsSuffix = "";
     else if (serverTpsFresh)
       tpsSuffix = th.fg("dim", " server");
     out.push(
@@ -1738,16 +2074,43 @@ class SidepanelPanel implements Component {
         inner,
       ),
     );
-    const serverPpsFresh =
+    const upstreamPpsFresh =
+      upstreamMetrics.promptPps > 0 &&
+      upstreamMetrics.promptPpsAt > 0 &&
+      now - upstreamMetrics.promptPpsAt < SERVER_RATE_STALE_MS;
+    const swapPpsFresh =
       swap.srvPps > 0 &&
       swap.srvPpsAt > 0 &&
-      Date.now() - swap.srvPpsAt < SERVER_RATE_STALE_MS;
-    const pps = serverPpsFresh
-      ? swap.srvPps
-      : perf.pps;
+      now - swap.srvPpsAt < SERVER_RATE_STALE_MS;
+    const serverPpsFresh =
+      upstreamPpsFresh || swapPpsFresh;
+    const serverPps = upstreamPpsFresh
+      ? upstreamMetrics.promptPps
+      : swap.srvPps;
+    const requestPpsFresh =
+      active &&
+      upstreamPpsFresh &&
+      upstreamMetrics.promptPpsAt >= perf.start;
+    let pps = perf.pps;
+    let ppsSuffix = " ~est";
+    if (promptLive) {
+      pps = live.promptPps;
+      ppsSuffix = live.promptPpsServer
+        ? " server"
+        : " ~live";
+    } else if (requestPpsFresh) {
+      pps = upstreamMetrics.promptPps;
+      ppsSuffix = " server";
+    } else if (active) {
+      pps = 0;
+      ppsSuffix = "";
+    } else if (serverPpsFresh) {
+      pps = serverPps;
+      ppsSuffix = "";
+    }
     let ppsDisplay = "—";
     if (pps)
-      ppsDisplay = `${pps.toFixed(1)}${serverPpsFresh ? "" : " ~est"}`;
+      ppsDisplay = `${pps.toFixed(1)}${ppsSuffix}`;
     out.push(
       this.field(
         "PROMPT/S",
@@ -1756,9 +2119,31 @@ class SidepanelPanel implements Component {
         "muted",
       ),
     );
+    if (
+      active &&
+      live.promptProgressKnown &&
+      live.promptTotal > 0
+    ) {
+      const progress = Math.min(
+        1,
+        Math.max(
+          0,
+          live.promptProcessed / live.promptTotal,
+        ),
+      );
+      const percent = Math.round(progress * 100);
+      out.push(
+        this.field(
+          "PROGRESS",
+          `${bar(th, Math.round(progress * 10), 10, "accent")} ${percent}% ${fmtTokens(live.promptProcessed)}/${fmtTokens(live.promptTotal)}`,
+          inner,
+          "muted",
+        ),
+      );
+    }
     if (compact) return out;
     const promptTotal = swap.cacheTokens + swap.inputTokens;
-    if (promptTotal) {
+    if (swap.kvKnown && promptTotal) {
       const hit = Math.round(
         (swap.cacheTokens / promptTotal) * 100,
       );
@@ -1792,7 +2177,11 @@ class SidepanelPanel implements Component {
     out.push(
       this.field(
         "DURATION",
-        perf.lastMs ? fmtMs(perf.lastMs) : "—",
+        perf.start
+          ? fmtMs(Math.max(1, Date.now() - perf.start))
+          : perf.lastMs
+            ? fmtMs(perf.lastMs)
+            : "—",
         inner,
         "muted",
       ),
@@ -2375,13 +2764,16 @@ export default async function (pi: ExtensionAPI) {
         )
           return;
         lastPoll = now;
-        void refreshSwapMetrics()
-          .then(refreshSwapRunning)
+        void Promise.all([
+          refreshSwapMetrics(),
+          refreshUpstreamMetrics(),
+        ])
+          .then(() => refreshSwapRunning())
           .then(repaint);
       }, BUSY_POLL_MS);
       clearInterval(liveTimer);
       liveTimer = setInterval(() => {
-        if (state.phase !== "idle")
+        if (perf.start > 0 || state.phase !== "idle")
           void refreshLiveContext().then(repaint);
       }, LIVE_POLL_MS);
       unsubscribeInput?.();
@@ -2474,6 +2866,13 @@ export default async function (pi: ExtensionAPI) {
       perf.first = 0;
       perf.chars = 0;
       perf.pps = 0;
+      live.promptTokens = 0;
+      live.promptAt = 0;
+      live.promptPps = 0;
+      live.promptPpsServer = false;
+      live.promptTotal = 0;
+      live.promptProcessed = 0;
+      live.promptProgressKnown = false;
     },
   );
 
@@ -2552,7 +2951,10 @@ export default async function (pi: ExtensionAPI) {
     }
     repaint();
     setTimeout(() => {
-      const refreshes = [refreshSwapMetrics()];
+      const refreshes = [
+        refreshSwapMetrics(),
+        refreshUpstreamMetrics(),
+      ];
       if (swap.kind === "llama-swap")
         refreshes.push(refreshSwapActivity());
       void Promise.all(refreshes).then(() => repaint());
