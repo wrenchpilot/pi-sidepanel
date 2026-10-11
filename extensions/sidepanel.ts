@@ -353,42 +353,36 @@ function piLensTdiFromRecord(
   return undefined;
 }
 
-function rememberPiLensEvent(data: JsonValue): void {
-  const paths = piLensEventPaths(data);
-  for (const path of paths) {
-    piLensState.currentFile = path;
-    const language = piLensLanguage(path);
-    if (language) piLensState.languages.add(language);
-  }
-  const record = jsonObject(data);
-  if (!record) return;
-  const primaryPath =
-    jsonString(record.filePath) ?? paths[0];
-  const grouped = new Map<string, PiLensFindingCounts>();
+function rememberPiLensPath(path: string): void {
+  piLensState.currentFile = path;
+  const language = piLensLanguage(path);
+  if (language) piLensState.languages.add(language);
+}
 
-  const addFinding = (
-    finding: JsonValue,
-    fallback: "error" | "warning" | "info",
-    fallbackPath = primaryPath,
-  ): void => {
-    const path = piLensFindingPath(finding) ?? fallbackPath;
-    if (!path) return;
-    const counts = grouped.get(path) ?? emptyPiLensCounts();
-    counts[piLensFindingSeverity(finding, fallback)]++;
-    grouped.set(path, counts);
-    piLensState.currentFile = path;
-    const language = piLensLanguage(path);
-    if (language) piLensState.languages.add(language);
-  };
+function addPiLensFinding(
+  grouped: Map<string, PiLensFindingCounts>,
+  finding: JsonValue,
+  fallback: "error" | "warning" | "info",
+  fallbackPath: string | undefined,
+): void {
+  const path = piLensFindingPath(finding) ?? fallbackPath;
+  if (!path) return;
+  const counts = grouped.get(path) ?? emptyPiLensCounts();
+  counts[piLensFindingSeverity(finding, fallback)]++;
+  grouped.set(path, counts);
+  rememberPiLensPath(path);
+}
 
-  const fileEntries = Array.isArray(record.files)
-    ? record.files
-    : [];
-  for (const value of fileEntries) {
+function recordPiLensFileEntries(
+  record: JsonObject,
+  grouped: Map<string, PiLensFindingCounts>,
+  primaryPath: string | undefined,
+): void {
+  const entries = Array.isArray(record.files) ? record.files : [];
+  for (const value of entries) {
     const entry = jsonObject(value);
-    if (!entry) continue;
-    const path = piLensFindingPath(entry);
-    if (!path) continue;
+    const path = entry ? piLensFindingPath(entry) : undefined;
+    if (!entry || !path) continue;
     const diagnostics = Array.isArray(entry.diagnostics)
       ? entry.diagnostics
       : [];
@@ -397,67 +391,96 @@ function rememberPiLensEvent(data: JsonValue): void {
       continue;
     }
     for (const finding of diagnostics)
-      addFinding(finding, "info", path);
+      addPiLensFinding(grouped, finding, "info", path ?? primaryPath);
   }
+}
 
+function recordPiLensFindingArrays(
+  record: JsonObject,
+  grouped: Map<string, PiLensFindingCounts>,
+  primaryPath: string | undefined,
+): void {
   const diagnostics = Array.isArray(record.diagnostics)
     ? record.diagnostics
-    : undefined;
+    : [];
   const findings = Array.isArray(record.findings)
     ? record.findings
-    : undefined;
-  if (diagnostics?.length) {
-    for (const finding of diagnostics)
-      addFinding(finding, "info");
-  } else if (findings?.length) {
-    for (const finding of findings)
-      addFinding(finding, "info");
-  } else {
-    const blockers = Array.isArray(record.blockers)
-      ? record.blockers
-      : [];
-    const warnings = Array.isArray(record.warnings)
-      ? record.warnings
-      : [];
-    for (const finding of blockers)
-      addFinding(finding, "error");
-    for (const finding of warnings)
-      addFinding(finding, "warning");
+    : [];
+  if (diagnostics.length || findings.length) {
+    for (const finding of diagnostics.length ? diagnostics : findings)
+      addPiLensFinding(grouped, finding, "info", primaryPath);
+    return;
   }
+  const blockers = Array.isArray(record.blockers)
+    ? record.blockers
+    : [];
+  const warnings = Array.isArray(record.warnings)
+    ? record.warnings
+    : [];
+  for (const finding of blockers)
+    addPiLensFinding(grouped, finding, "error", primaryPath);
+  for (const finding of warnings)
+    addPiLensFinding(grouped, finding, "warning", primaryPath);
+}
 
-  let explicitErrors = jsonNumber(record.errorCount);
-  if (explicitErrors === undefined)
-    explicitErrors = jsonNumber(record.errors);
-  let explicitWarnings = jsonNumber(record.warningCount);
-  if (explicitWarnings === undefined)
-    explicitWarnings = jsonNumber(record.warnings);
-  if (
-    !grouped.size &&
-    primaryPath &&
-    (explicitErrors !== undefined ||
-      explicitWarnings !== undefined)
-  ) {
-    grouped.set(primaryPath, {
-      errors: Math.max(0, explicitErrors ?? 0),
-      warnings: Math.max(0, explicitWarnings ?? 0),
-      info: 0,
-    });
-  }
+function recordPiLensExplicitCounts(
+  record: JsonObject,
+  grouped: Map<string, PiLensFindingCounts>,
+  primaryPath: string | undefined,
+): void {
+  if (grouped.size || !primaryPath) return;
+  const errors =
+    jsonNumber(record.errorCount) ?? jsonNumber(record.errors);
+  const warnings =
+    jsonNumber(record.warningCount) ?? jsonNumber(record.warnings);
+  if (errors === undefined && warnings === undefined) return;
+  grouped.set(primaryPath, {
+    errors: Math.max(0, errors ?? 0),
+    warnings: Math.max(0, warnings ?? 0),
+    info: 0,
+  });
+}
 
-  const hasSnapshot =
-    fileEntries.length > 0 ||
-    diagnostics !== undefined ||
-    findings !== undefined ||
+function piLensHasSnapshot(record: JsonObject): boolean {
+  return (
+    (Array.isArray(record.files) && record.files.length > 0) ||
+    Array.isArray(record.diagnostics) ||
+    Array.isArray(record.findings) ||
     Array.isArray(record.blockers) ||
-    Array.isArray(record.warnings);
+    Array.isArray(record.warnings)
+  );
+}
+
+function applyPiLensCounts(
+  grouped: Map<string, PiLensFindingCounts>,
+  primaryPath: string | undefined,
+  hasSnapshot: boolean,
+): void {
   if (!grouped.size && hasSnapshot && primaryPath)
     grouped.set(primaryPath, emptyPiLensCounts());
-
   for (const [path, counts] of grouped) {
     if (counts.errors || counts.warnings || counts.info)
       piLensState.files.set(path, counts);
     else piLensState.files.delete(path);
   }
+}
+
+function rememberPiLensEvent(data: JsonValue): void {
+  const paths = piLensEventPaths(data);
+  for (const path of paths) rememberPiLensPath(path);
+  const record = jsonObject(data);
+  if (!record) return;
+  const primaryPath =
+    jsonString(record.filePath) ?? paths[0];
+  const grouped = new Map<string, PiLensFindingCounts>();
+  recordPiLensFileEntries(record, grouped, primaryPath);
+  recordPiLensFindingArrays(record, grouped, primaryPath);
+  recordPiLensExplicitCounts(record, grouped, primaryPath);
+  applyPiLensCounts(
+    grouped,
+    primaryPath,
+    piLensHasSnapshot(record),
+  );
 }
 
 function truncateTo(
@@ -918,109 +941,159 @@ async function refreshUpstreamMetrics(): Promise<void> {
   }
 }
 
-function parseSwapMetrics(text: string): void {
-  const gpus = new Map<string, GpuStat>();
-  let ramUsed = 0;
-  let ramTotal = 0;
-  let srvTps = 0;
-  let srvPps = 0;
-  let cacheTokens = 0;
-  let promptTokens = 0;
-  let hasCacheTokens = false;
-  let hasPromptTokens = false;
+interface SwapMetric {
+  key: string;
+  labels: string;
+  value: number;
+  matchesModel: boolean;
+}
 
-  for (const line of text.split("\n")) {
-    const m =
-      /^(?:llamaswap|ninfer)_([a-z_]+)(?:\{([^}]*)\})?\s+(\S+)$/.exec(
-        line,
-      );
-    if (!m) continue;
-    const key = m[1];
-    if (!key) continue;
-    const value = Number(m[3]);
-    if (!Number.isFinite(value)) continue;
-    const labels = m[2] ?? "";
-    const metricModel = /(?:model|model_id|model_name)="([^"]*)"/.exec(
-      labels,
-    )?.[1];
-    const metricMatchesModel =
+interface SwapMetricAccumulator {
+  gpus: Map<string, GpuStat>;
+  ramUsed: number;
+  ramTotal: number;
+  srvTps: number;
+  srvPps: number;
+  cacheTokens: number;
+  promptTokens: number;
+  hasCacheTokens: boolean;
+  hasPromptTokens: boolean;
+}
+
+function parseSwapMetric(line: string): SwapMetric | undefined {
+  const match =
+    /^(?:llamaswap|ninfer)_([a-z_]+)(?:\{([^}]*)\})?\s+(\S+)$/.exec(line);
+  if (!match?.[1]) return undefined;
+  const value = Number(match[3]);
+  if (!Number.isFinite(value)) return undefined;
+  const labels = match[2] ?? "";
+  const metricModel = /(?:model|model_id|model_name)="([^"]*)"/.exec(labels)?.[1];
+  return {
+    key: match[1],
+    labels,
+    value,
+    matchesModel:
       !metricModel ||
       metricModel === swap.realId ||
-      metricModel === swap.modelId;
-    if (key === "memory_used_bytes") ramUsed = value;
-    else if (key === "memory_total_bytes") ramTotal = value;
-    else if (
-      key === "last_tokens_per_second" &&
-      metricMatchesModel
-    )
-      srvTps = Math.max(0, value);
-    else if (
-      key === "last_prompt_per_second" &&
-      metricMatchesModel
-    )
-      srvPps = Math.max(0, value);
-    else if (
-      key === "last_cache_tokens" &&
-      metricMatchesModel
-    ) {
-      cacheTokens = Math.max(0, value);
-      hasCacheTokens = true;
-    } else if (
-      key === "last_prompt_tokens" &&
-      metricMatchesModel
-    ) {
-      promptTokens = Math.max(0, value);
-      hasPromptTokens = true;
-    }
-    if (!key.startsWith("gpu_")) continue;
-    const id = /id="([^"]*)"/.exec(labels)?.[1] ?? "0";
-    const gpu = gpus.get(id) ?? {
-      name: /name="([^"]*)"/.exec(labels)?.[1] ?? "GPU",
-      util: 0,
-      memUsed: 0,
-      memTotal: 0,
-      temp: 0,
-      power: 0,
-    };
-    if (key === "gpu_util_percent") gpu.util = value;
-    else if (key === "gpu_memory_used_bytes")
-      gpu.memUsed = value;
-    else if (key === "gpu_memory_total_bytes")
-      gpu.memTotal = value;
-    else if (key === "gpu_temperature_celsius")
-      gpu.temp = value;
-    else if (key === "gpu_power_draw_watts")
-      gpu.power = value;
-    gpus.set(id, gpu);
-  }
+      metricModel === swap.modelId,
+  };
+}
 
-  // Replace instantaneous metrics, but retain the last valid throughput
-  // measurement when the server reports zero or omits it between requests.
-  swap.ramUsed = ramUsed;
-  swap.ramTotal = ramTotal;
-  if (srvTps > 0) {
-    swap.srvTps = srvTps;
-    swap.srvTpsAt = Date.now();
+function createSwapMetricAccumulator(): SwapMetricAccumulator {
+  return {
+    gpus: new Map(),
+    ramUsed: 0,
+    ramTotal: 0,
+    srvTps: 0,
+    srvPps: 0,
+    cacheTokens: 0,
+    promptTokens: 0,
+    hasCacheTokens: false,
+    hasPromptTokens: false,
+  };
+}
+
+function updateGpuMetric(
+  accumulator: SwapMetricAccumulator,
+  metric: SwapMetric,
+): void {
+  if (!metric.key.startsWith("gpu_")) return;
+  const id = /id="([^"]*)"/.exec(metric.labels)?.[1] ?? "0";
+  const gpu = accumulator.gpus.get(id) ?? {
+    name: /name="([^"]*)"/.exec(metric.labels)?.[1] ?? "GPU",
+    util: 0,
+    memUsed: 0,
+    memTotal: 0,
+    temp: 0,
+    power: 0,
+  };
+  if (metric.key === "gpu_util_percent") gpu.util = metric.value;
+  else if (metric.key === "gpu_memory_used_bytes")
+    gpu.memUsed = metric.value;
+  else if (metric.key === "gpu_memory_total_bytes")
+    gpu.memTotal = metric.value;
+  else if (metric.key === "gpu_temperature_celsius")
+    gpu.temp = metric.value;
+  else if (metric.key === "gpu_power_draw_watts")
+    gpu.power = metric.value;
+  accumulator.gpus.set(id, gpu);
+}
+
+function updateSwapMetric(
+  accumulator: SwapMetricAccumulator,
+  metric: SwapMetric,
+): void {
+  switch (metric.key) {
+    case "memory_used_bytes":
+      accumulator.ramUsed = metric.value;
+      break;
+    case "memory_total_bytes":
+      accumulator.ramTotal = metric.value;
+      break;
+    case "last_tokens_per_second":
+      if (metric.matchesModel)
+        accumulator.srvTps = Math.max(0, metric.value);
+      break;
+    case "last_prompt_per_second":
+      if (metric.matchesModel)
+        accumulator.srvPps = Math.max(0, metric.value);
+      break;
+    case "last_cache_tokens":
+      if (metric.matchesModel) {
+        accumulator.cacheTokens = Math.max(0, metric.value);
+        accumulator.hasCacheTokens = true;
+      }
+      break;
+    case "last_prompt_tokens":
+      if (metric.matchesModel) {
+        accumulator.promptTokens = Math.max(0, metric.value);
+        accumulator.hasPromptTokens = true;
+      }
+      break;
+    default:
+      break;
   }
-  if (srvPps > 0) {
-    swap.srvPps = srvPps;
-    swap.srvPpsAt = Date.now();
+  updateGpuMetric(accumulator, metric);
+}
+
+function applySwapMetricAccumulator(
+  accumulator: SwapMetricAccumulator,
+): void {
+  swap.ramUsed = accumulator.ramUsed;
+  swap.ramTotal = accumulator.ramTotal;
+  const now = Date.now();
+  if (accumulator.srvTps > 0) {
+    swap.srvTps = accumulator.srvTps;
+    swap.srvTpsAt = now;
   }
-  if (hasCacheTokens || hasPromptTokens) {
-    const nextCache = hasCacheTokens
-      ? cacheTokens
+  if (accumulator.srvPps > 0) {
+    swap.srvPps = accumulator.srvPps;
+    swap.srvPpsAt = now;
+  }
+  if (accumulator.hasCacheTokens || accumulator.hasPromptTokens) {
+    const nextCache = accumulator.hasCacheTokens
+      ? accumulator.cacheTokens
       : swap.cacheTokens;
     swap.cacheTokens = nextCache;
-    if (hasPromptTokens)
+    if (accumulator.hasPromptTokens)
       swap.inputTokens = Math.max(
         0,
-        promptTokens - nextCache,
+        accumulator.promptTokens - nextCache,
       );
     swap.kvKnown = true;
   }
-  swap.gpus = [...gpus.entries()]
+  swap.gpus = [...accumulator.gpus.entries()]
     .sort(([a], [b]) => Number(a) - Number(b))
-    .map(([, g]) => g);
+    .map(([, gpu]) => gpu);
+}
+
+function parseSwapMetrics(text: string): void {
+  const accumulator = createSwapMetricAccumulator();
+  for (const line of text.split("\n")) {
+    const metric = parseSwapMetric(line);
+    if (metric) updateSwapMetric(accumulator, metric);
+  }
+  applySwapMetricAccumulator(accumulator);
 }
 
 function sampleEnergy(now = Date.now()): void {
@@ -1308,167 +1381,205 @@ function resetSessionState(): void {
   });
 }
 
+function liveSlotProgress(slot: SwapSlot): number {
+  if (finiteNumber(slot.n_prompt_tokens_processed))
+    return slot.n_prompt_tokens_processed;
+  return slot.n_prompt_tokens ?? 0;
+}
+
+function activeLiveSlot(slots: SwapSlot[]): SwapSlot | undefined {
+  const busy = slots.filter((slot) => {
+    if (slot.is_processing !== true) return false;
+    return liveSlotProgress(slot) > 0;
+  });
+  return busy.reduce<SwapSlot | undefined>((best, slot) => {
+    if (!best || liveSlotProgress(slot) > liveSlotProgress(best))
+      return slot;
+    return best;
+  }, undefined);
+}
+
+function reportedSlotProgress(
+  slot: SwapSlot,
+): number | undefined {
+  if (
+    finiteNumber(slot.progress) &&
+    slot.progress > 0 &&
+    slot.progress <= 1
+  )
+    return slot.progress;
+  return undefined;
+}
+
+function slotPromptTotal(slot: SwapSlot): number {
+  if (
+    finiteNumber(slot.n_prompt_tokens) &&
+    slot.n_prompt_tokens > 0
+  )
+    return slot.n_prompt_tokens;
+  return 0;
+}
+
+function slotPromptBudget(slot: SwapSlot): number {
+  const nRemain = slot.next_token?.[0]?.n_remain;
+  if (
+    !finiteNumber(slot.n_ctx) ||
+    !finiteNumber(nRemain) ||
+    nRemain < 0
+  )
+    return 0;
+  return Math.max(0, slot.n_ctx - nRemain);
+}
+
+function estimatedPromptTotal(
+  promptTokens: number,
+  slotTotal: number,
+  promptBudget: number,
+  reportedProgress: number | undefined,
+): number {
+  if (reportedProgress !== undefined)
+    return Math.ceil(promptTokens / reportedProgress);
+  const contextTokens = liveCtx?.getContextUsage?.()?.tokens;
+  const current = Math.max(slotTotal, promptBudget);
+  if (contextTokens != null && contextTokens > promptTokens)
+    return contextTokens;
+  return current;
+}
+
+function promptFinished(
+  slot: SwapSlot,
+  promptTokens: number,
+  promptBudget: number,
+): boolean {
+  const generationStarted =
+    slot.next_token?.some(
+      (token) =>
+        finiteNumber(token.n_decoded) && token.n_decoded > 0,
+    ) ?? false;
+  if (generationStarted) return true;
+  if (promptBudget > 0) return promptTokens >= promptBudget;
+  return (
+    finiteNumber(slot.n_prompt_tokens) &&
+    finiteNumber(slot.n_prompt_tokens_processed) &&
+    slot.n_prompt_tokens_processed >= slot.n_prompt_tokens
+  );
+}
+
+function updateLivePromptProgress(
+  slot: SwapSlot,
+  promptTokens: number,
+): void {
+  const reportedProgress = reportedSlotProgress(slot);
+  const slotTotal = slotPromptTotal(slot);
+  const promptBudget = slotPromptBudget(slot);
+  const estimatedTotal = estimatedPromptTotal(
+    promptTokens,
+    slotTotal,
+    promptBudget,
+    reportedProgress,
+  );
+  const finished = promptFinished(
+    slot,
+    promptTokens,
+    promptBudget,
+  );
+  live.promptTotal = finished ? promptTokens : estimatedTotal;
+  live.promptProcessed = promptTokens;
+  live.promptProgressKnown = live.promptTotal > 0;
+  live.promptTotalEstimated =
+    !finished &&
+    reportedProgress === undefined &&
+    promptBudget === 0 &&
+    slotTotal === 0 &&
+    estimatedTotal > 0;
+}
+
+function updateLiveCache(slot: SwapSlot): void {
+  if (
+    !finiteNumber(slot.n_prompt_tokens) ||
+    !finiteNumber(slot.n_prompt_tokens_cache)
+  )
+    return;
+  swap.cacheTokens = Math.max(0, slot.n_prompt_tokens_cache);
+  swap.inputTokens = Math.max(
+    0,
+    slot.n_prompt_tokens - slot.n_prompt_tokens_cache,
+  );
+  swap.kvKnown = true;
+}
+
+function updateLivePromptRate(
+  slot: SwapSlot,
+  promptTokens: number,
+  now: number,
+): void {
+  if (perf.first) return;
+  const serverPps = slot.timings?.prompt_per_second;
+  const timingPromptN = slot.timings?.prompt_n;
+  const timingPromptMs = slot.timings?.prompt_ms;
+  if (finiteNumber(serverPps) && serverPps > 0) {
+    live.promptPps = serverPps;
+    live.promptPpsServer = true;
+  } else if (
+    finiteNumber(timingPromptN) &&
+    finiteNumber(timingPromptMs) &&
+    timingPromptN > 0 &&
+    timingPromptMs > 0
+  ) {
+    live.promptPps = timingPromptN / (timingPromptMs / 1000);
+    live.promptPpsServer = true;
+  } else if (live.promptAt && promptTokens < live.promptTokens) {
+    live.promptPps = 0;
+    live.promptPpsServer = false;
+  } else {
+    const elapsed = perf.start
+      ? (now - perf.start) / 1000
+      : 0;
+    if (
+      elapsed >= MIN_PROMPT_SAMPLE_MS / 1000 &&
+      promptTokens > 0
+    ) {
+      live.promptPps = promptTokens / elapsed;
+      live.promptPpsServer = false;
+    }
+  }
+  live.promptTokens = promptTokens;
+  live.promptAt = now;
+}
+
+function updateLiveSlot(slot: SwapSlot, now: number): void {
+  const promptTokens = liveSlotProgress(slot);
+  updateLivePromptProgress(slot, promptTokens);
+  updateLiveCache(slot);
+  updateLivePromptRate(slot, promptTokens, now);
+  live.tokens = finiteNumber(slot.n_prompt_tokens)
+    ? slot.n_prompt_tokens
+    : promptTokens;
+  live.at = now;
+}
+
 async function refreshLiveContext(): Promise<void> {
   if (swap.kind !== "llama-swap" || swap.state !== "ready")
     return;
   const version = swapConnectionVersion;
   const modelId = swap.modelId;
   const base = swap.base;
-  const realId = swap.realId;
-  const headers = { ...swap.headers };
   if (!base) return;
   try {
     const response = await swapFetch(
       base,
-      headers,
-      `/upstream/${encodeURIComponent(realId)}/slots?model=${encodeURIComponent(realId)}`,
+      { ...swap.headers },
+      `/upstream/${encodeURIComponent(swap.realId)}/slots?model=${encodeURIComponent(swap.realId)}`,
       1500,
     );
     if (!response.ok) return;
     const slots = (await response.json()) as SwapSlot[];
     if (!isCurrentSwap(version, modelId, base)) return;
-    const busy = slots.filter((slot) => {
-      if (slot.is_processing !== true) return false;
-      const processed = slot.n_prompt_tokens_processed;
-      const total = slot.n_prompt_tokens;
-      return (
-        (finiteNumber(processed) && processed > 0) ||
-        (finiteNumber(total) && total > 0)
-      );
-    });
-    if (!busy.length) return;
-    const progressOf = (slot: SwapSlot): number => {
-      if (finiteNumber(slot.n_prompt_tokens_processed))
-        return slot.n_prompt_tokens_processed;
-      return slot.n_prompt_tokens ?? 0;
-    };
-    const now = Date.now();
-    const activeSlot = busy.reduce((best, slot) =>
-      progressOf(slot) > progressOf(best) ? slot : best,
-    );
-    const promptTokens = progressOf(activeSlot);
-    const reportedProgress =
-      finiteNumber(activeSlot.progress) &&
-      activeSlot.progress > 0 &&
-      activeSlot.progress <= 1
-        ? activeSlot.progress
-        : undefined;
-    const slotTotal =
-      finiteNumber(activeSlot.n_prompt_tokens) &&
-      activeSlot.n_prompt_tokens > 0
-        ? activeSlot.n_prompt_tokens
-        : 0;
-    const nRemain =
-      activeSlot.next_token?.[0]?.n_remain;
-    const promptBudget =
-      finiteNumber(activeSlot.n_ctx) &&
-      finiteNumber(nRemain) &&
-      nRemain >= 0
-        ? Math.max(0, activeSlot.n_ctx - nRemain)
-        : 0;
-    const contextTokens =
-      liveCtx?.getContextUsage?.()?.tokens ?? undefined;
-    let estimatedTotal = Math.max(
-      slotTotal,
-      promptBudget,
-    );
-    if (reportedProgress !== undefined)
-      estimatedTotal = Math.ceil(
-        promptTokens / reportedProgress,
-      );
-    else if (
-      !estimatedTotal &&
-      contextTokens !== undefined &&
-      contextTokens > promptTokens
-    )
-      estimatedTotal = contextTokens;
-    const generationStarted =
-      activeSlot.next_token?.some(
-        (token) =>
-          finiteNumber(token.n_decoded) &&
-          token.n_decoded > 0,
-      ) ?? false;
-    const promptFinished =
-      generationStarted ||
-      (promptBudget > 0
-        ? promptTokens >= promptBudget
-        : finiteNumber(activeSlot.n_prompt_tokens) &&
-          finiteNumber(activeSlot.n_prompt_tokens_processed) &&
-          activeSlot.n_prompt_tokens_processed >=
-            activeSlot.n_prompt_tokens);
-    live.promptTotal = promptFinished
-      ? promptTokens
-      : estimatedTotal;
-    live.promptProcessed = promptTokens;
-    live.promptProgressKnown = live.promptTotal > 0;
-    live.promptTotalEstimated =
-      !promptFinished &&
-      reportedProgress === undefined &&
-      promptBudget === 0 &&
-      slotTotal === 0 &&
-      estimatedTotal > 0;
-    if (
-      finiteNumber(activeSlot.n_prompt_tokens) &&
-      finiteNumber(activeSlot.n_prompt_tokens_cache)
-    ) {
-      swap.cacheTokens = Math.max(
-        0,
-        activeSlot.n_prompt_tokens_cache,
-      );
-      swap.inputTokens = Math.max(
-        0,
-        activeSlot.n_prompt_tokens -
-          activeSlot.n_prompt_tokens_cache,
-      );
-      swap.kvKnown = true;
-    }
-    const serverPps = activeSlot.timings?.prompt_per_second;
-    const timingPromptN = activeSlot.timings?.prompt_n;
-    const timingPromptMs = activeSlot.timings?.prompt_ms;
-    if (!perf.first) {
-      if (finiteNumber(serverPps) && serverPps > 0) {
-        live.promptPps = serverPps;
-        live.promptPpsServer = true;
-      } else if (
-        finiteNumber(timingPromptN) &&
-        finiteNumber(timingPromptMs) &&
-        timingPromptN > 0 &&
-        timingPromptMs > 0
-      ) {
-        live.promptPps =
-          timingPromptN / (timingPromptMs / 1000);
-        live.promptPpsServer = true;
-      } else if (
-        live.promptAt &&
-        promptTokens < live.promptTokens
-      ) {
-        // A new slot/request reset its processed-token counter.
-        live.promptPps = 0;
-        live.promptPpsServer = false;
-      } else {
-        // The slot exposes cumulative processed tokens, not elapsed timing.
-        // Use the request start as the denominator; using the delta between
-        // polls incorrectly turns a 2,048-token batch into ~680 tok/s.
-        const elapsed = perf.start
-          ? (now - perf.start) / 1000
-          : 0;
-        if (
-          elapsed >= MIN_PROMPT_SAMPLE_MS / 1000 &&
-          promptTokens > 0
-        ) {
-          live.promptPps = promptTokens / elapsed;
-          live.promptPpsServer = false;
-        }
-      }
-      live.promptTokens = promptTokens;
-      live.promptAt = now;
-    }
-    live.tokens = finiteNumber(activeSlot.n_prompt_tokens)
-      ? activeSlot.n_prompt_tokens
-      : promptTokens;
-    live.at = now;
+    const slot = activeLiveSlot(slots);
+    if (!slot) return;
+    updateLiveSlot(slot, Date.now());
   } catch {
-    // the pi estimate stays
+    // The previous estimate remains visible when the server is unavailable.
   }
 }
 
@@ -1901,80 +2012,123 @@ function costRow(
     panel.theme.fg("dim", ` (ses ${fmtMoney(swap.energyWh)})`), inner: inner, tone: "warning" });
 }
 
+interface StatusPresentation {
+  title: string;
+  tone: ThemeColor;
+  status: string;
+}
+
+function toolPresentation(
+  theme: Theme,
+  inner: number,
+  now: number,
+  pulse: string,
+): StatusPresentation {
+  const fallen = now - state.lastFailAt < FAIL_FLASH_MS;
+  const title = fallen
+    ? `FAILED · ${state.lastFailTool}`
+    : `${state.toolName || "tool"} · ${secsSince(state.phaseSince, now)}s`;
+  const target = fallen
+    ? state.lastFailTarget || state.lastFailTool
+    : state.toolTarget || state.toolName;
+  return {
+    title,
+    tone: fallen ? "error" : "warning",
+    status: `${pulse} ${theme.fg(fallen ? "error" : "text", truncateToWidth(target || "tool", inner - 4))}`,
+  };
+}
+
+function phasePresentation(
+  theme: Theme,
+  inner: number,
+  now: number,
+  pulse: string,
+): StatusPresentation | undefined {
+  const idle = state.phase === "idle";
+  const fallen = now - state.lastFailAt < FAIL_FLASH_MS;
+  if (state.phase === "tool" || (idle && fallen))
+    return toolPresentation(theme, inner, now, pulse);
+  if (state.phase === "thinking")
+    return {
+      title: `THINKING · ${secsSince(state.phaseSince, now)}s`,
+      tone: "accent",
+      status: `${pulse} deliberating`,
+    };
+  if (state.phase === "responding") {
+    const tps = liveTps();
+    return {
+      title: `RESPONDING${tps ? ` · ${tps.toFixed(1)} tok/s` : ""}`,
+      tone: "success",
+      status: `${pulse} streaming`,
+    };
+  }
+  if (state.compacting)
+    return {
+      title: `COMPACTING · ${state.compactBy || "context"} · ${secsSince(state.compactSince, now)}s`,
+      tone: "warning",
+      status: `${pulse} compacting context`,
+    };
+  return undefined;
+}
+
+function swapPresentation(
+  now: number,
+  pulse: string,
+): StatusPresentation | undefined {
+  if (state.phase !== "idle") return undefined;
+  if (swap.state === "checking" || swap.state === "loading")
+    return {
+      title: swap.state === "loading"
+        ? `LOADING · ${secsSince(swap.since)}s`
+        : "CHECKING",
+      tone: "warning",
+      status: `${pulse} loading model`,
+    };
+  if (swap.state === "error")
+    return {
+      title: "OFFLINE",
+      tone: "error",
+      status: `${pulse} swap error`,
+    };
+  if (swap.state === "asleep")
+    return {
+      title: "ASLEEP · type to wake",
+      tone: "muted",
+      status: `${pulse} model asleep`,
+    };
+  if (swap.state === "ready" && now - swap.since < ONLINE_MS)
+    return {
+      title: swap.loadMs ? `ONLINE · ${fmtMs(swap.loadMs)}` : "ONLINE",
+      tone: "success",
+      status: `${pulse} model ready`,
+    };
+  return undefined;
+}
+
 function statusSection(
   panel: SidepanelPanel,
   inner: number,
 ): string[] {
-  const th = panel.theme;
   const now = Date.now();
   const pulse = animating(now)
-    ? th.fg("accent", "◈")
-    : th.fg("dim", "○");
-  const idle = state.phase === "idle";
-  const fallen = now - state.lastFailAt < FAIL_FLASH_MS;
-  let title: string;
-  let titleTone: ThemeColor = "accent";
-  let status: string;
-  if (state.phase === "tool" || (idle && fallen)) {
-    title = fallen
-      ? `FAILED · ${state.lastFailTool}`
-      : `${state.toolName || "tool"} · ${secsSince(state.phaseSince, now)}s`;
-    titleTone = fallen ? "error" : "warning";
-    const target =
-      (fallen
-        ? state.lastFailTarget || state.lastFailTool
-        : state.toolTarget || state.toolName) || "tool";
-    status = `${pulse} ${th.fg(fallen ? "error" : "text", truncateToWidth(target, inner - 4))}`;
-  } else if (state.phase === "thinking") {
-    title = `THINKING · ${secsSince(state.phaseSince, now)}s`;
-    titleTone = "accent";
-    status = `${pulse} deliberating`;
-  } else if (state.phase === "responding") {
-    const tps = liveTps();
-    title = `RESPONDING${tps ? ` · ${tps.toFixed(1)} tok/s` : ""}`;
-    titleTone = "success";
-    status = `${pulse} streaming`;
-  } else if (state.compacting) {
-    title = `COMPACTING · ${state.compactBy || "context"} · ${secsSince(state.compactSince, now)}s`;
-    titleTone = "warning";
-    status = `${pulse} compacting context`;
-  } else if (
-    idle && (swap.state === "checking" || swap.state === "loading")
-  ) {
-    title = swap.state === "loading"
-      ? `LOADING · ${secsSince(swap.since)}s`
-      : "CHECKING";
-    titleTone = "warning";
-    status = `${pulse} loading model`;
-  } else if (idle && swap.state === "error") {
-    title = "OFFLINE";
-    titleTone = "error";
-    status = `${pulse} swap error`;
-  } else if (idle && swap.state === "asleep") {
-    title = "ASLEEP · type to wake";
-    titleTone = "muted";
-    status = `${pulse} model asleep`;
-  } else if (
-    idle && swap.state === "ready" &&
-    now - swap.since < ONLINE_MS
-  ) {
-    title = swap.loadMs ? `ONLINE · ${fmtMs(swap.loadMs)}` : "ONLINE";
-    titleTone = "success";
-    status = `${pulse} model ready`;
-  } else {
-    title = "STANDBY";
-    titleTone = "muted";
-    status = `${pulse} at rest`;
-  }
+    ? panel.theme.fg("accent", "◈")
+    : panel.theme.fg("dim", "○");
+  const presentation =
+    phasePresentation(panel.theme, inner, now, pulse) ??
+    swapPresentation(now, pulse) ?? {
+      title: "STANDBY",
+      tone: "muted" as ThemeColor,
+      status: `${pulse} at rest`,
+    };
   return [
     panelLabel(panel, {
       inner,
-      label: title,
+      label: presentation.title,
       left: "┌",
       right: "┐",
-      tone: titleTone,
+      tone: presentation.tone,
     }),
-    panelFrame(panel, status, inner),
+    panelFrame(panel, presentation.status, inner),
   ];
 }
 
@@ -2026,34 +2180,11 @@ function telemetryRows(
   return out;
 }
 
-function piLensRows(
+function piLensFileRows(
   panel: SidepanelPanel,
   inner: number,
 ): string[] {
-  const values = piLensStatusValues();
-  const technicalDebt = piLensTechnicalDebt();
-  const languages = [...piLensState.languages]
-    .sort((a, b) => a.localeCompare(b))
-    .join(" ");
-  if (
-    !piLensState.available &&
-    !values.length &&
-    !technicalDebt &&
-    !languages &&
-    !piLensState.currentFile &&
-    !piLensState.files.size
-  )
-    return [];
-  const out = [panelSep(panel, inner, "PI-LENS")];
-  if (languages)
-    out.push(
-      ...panelFieldRows(panel, {
-        label: "LANG",
-        value: languages,
-        inner,
-        tone: "muted",
-      }),
-    );
+  const out: string[] = [];
   const files = [...piLensState.files.entries()].sort(
     ([a], [b]) => a.localeCompare(b),
   );
@@ -2063,70 +2194,142 @@ function piLensRows(
       displayPath(path) === displayPath(piLensState.currentFile),
   );
   if (piLensState.currentFile && !currentFileHasIssues)
-    out.push(
-      ...panelFieldRows(panel, {
-        label: "FILE",
-        value: displayPath(piLensState.currentFile),
-        inner,
-        tone: "text",
-      }),
-    );
-  if (files.length) {
-    const totals = files.reduce(
-      (sum, [, counts]) => ({
-        errors: sum.errors + counts.errors,
-        warnings: sum.warnings + counts.warnings,
-        info: sum.info + counts.info,
-      }),
-      emptyPiLensCounts(),
-    );
-    const totalParts = [
-      `${totals.errors} ${totals.errors === 1 ? "error" : "errors"}`,
-      `${totals.warnings} ${totals.warnings === 1 ? "warning" : "warnings"}`,
-    ];
-    if (totals.info) totalParts.push(`${totals.info} info`);
-    out.push(
-      ...panelFieldRows(panel, {
-        label: "ISSUES",
-        value: `${files.length} ${files.length === 1 ? "file" : "files"} · ${totalParts.join(" · ")}`,
-        inner,
-        tone: totals.errors ? "error" : "warning",
-      }),
-    );
-    for (const [path, counts] of files) {
-      const parts: string[] = [];
-      if (counts.errors) parts.push(`${counts.errors}E`);
-      if (counts.warnings) parts.push(`${counts.warnings}W`);
-      if (counts.info) parts.push(`${counts.info}I`);
-      let fileTone: ThemeColor = "muted";
-      if (counts.errors) fileTone = "error";
-      else if (counts.warnings) fileTone = "warning";
-      out.push(
-        ...panelFieldRows(panel, {
-          label: "FILE",
-          value: `${displayPath(path)} · ${parts.join(" ")}`,
-          inner,
-          tone: fileTone,
-        }),
-      );
-    }
+    out.push(...panelFieldRows(panel, {
+      label: "FILE",
+      value: displayPath(piLensState.currentFile),
+      inner,
+      tone: "text",
+    }));
+  if (!files.length) return out;
+  const totals = files.reduce(
+    (sum, [, counts]) => ({
+      errors: sum.errors + counts.errors,
+      warnings: sum.warnings + counts.warnings,
+      info: sum.info + counts.info,
+    }),
+    emptyPiLensCounts(),
+  );
+  const totalParts = [
+    `${totals.errors} ${totals.errors === 1 ? "error" : "errors"}`,
+    `${totals.warnings} ${totals.warnings === 1 ? "warning" : "warnings"}`,
+  ];
+  if (totals.info) totalParts.push(`${totals.info} info`);
+  out.push(...panelFieldRows(panel, {
+    label: "ISSUES",
+    value: `${files.length} ${files.length === 1 ? "file" : "files"} · ${totalParts.join(" · ")}`,
+    inner,
+    tone: totals.errors ? "error" : "warning",
+  }));
+  for (const [path, counts] of files) {
+    const parts: string[] = [];
+    if (counts.errors) parts.push(`${counts.errors}E`);
+    if (counts.warnings) parts.push(`${counts.warnings}W`);
+    if (counts.info) parts.push(`${counts.info}I`);
+    let tone: ThemeColor = "muted";
+    if (counts.errors) tone = "error";
+    else if (counts.warnings) tone = "warning";
+    out.push(...panelFieldRows(panel, {
+      label: "FILE",
+      value: `${displayPath(path)} · ${parts.join(" ")}`,
+      inner,
+      tone,
+    }));
   }
-  const statusWidth = Math.max(1, inner - 1);
+  return out;
+}
+
+function piLensStatusRows(
+  panel: SidepanelPanel,
+  inner: number,
+  values: string[],
+): string[] {
+  const width = Math.max(1, inner - 1);
+  const out: string[] = [];
   for (const value of values) {
-    const lines = wrapTextWithAnsi(value, statusWidth);
-    for (const line of lines)
+    for (const line of wrapTextWithAnsi(value, width))
       out.push(panelFrame(panel, ` ${line}`, inner));
   }
-  if (piLensState.available || technicalDebt)
-    out.push(
-      ...panelFieldRows(panel, {
-        label: "TDI",
-        value: technicalDebt ?? "—",
-        inner,
-        tone: technicalDebt ? "warning" : "muted",
-      }),
-    );
   return out;
+}
+
+function piLensRows(
+  panel: SidepanelPanel,
+  inner: number,
+): string[] {
+  const values = piLensStatusValues();
+  const technicalDebt = piLensTechnicalDebt();
+  const languages = [...piLensState.languages]
+    .sort((a, b) => a.localeCompare(b))
+    .join(" ");
+  const hasData =
+    piLensState.available ||
+    values.length > 0 ||
+    Boolean(technicalDebt) ||
+    Boolean(languages) ||
+    Boolean(piLensState.currentFile) ||
+    piLensState.files.size > 0;
+  if (!hasData) return [];
+  const out = [panelSep(panel, inner, "PI-LENS")];
+  if (languages)
+    out.push(...panelFieldRows(panel, {
+      label: "LANG",
+      value: languages,
+      inner,
+      tone: "muted",
+    }));
+  out.push(
+    ...piLensFileRows(panel, inner),
+    ...piLensStatusRows(panel, inner, values),
+  );
+  if (piLensState.available || technicalDebt)
+    out.push(...panelFieldRows(panel, {
+      label: "TDI",
+      value: technicalDebt ?? "—",
+      inner,
+      tone: technicalDebt ? "warning" : "muted",
+    }));
+  return out;
+}
+
+interface TokenRateState {
+  upstreamFresh: boolean;
+  swapFresh: boolean;
+  requestFresh: boolean;
+  serverTps: number;
+}
+
+function freshRate(
+  value: number,
+  timestamp: number,
+  now: number,
+): boolean {
+  return value > 0 &&
+    timestamp > 0 &&
+    now - timestamp < SERVER_RATE_STALE_MS;
+}
+
+function tokenRateState(now: number): TokenRateState {
+  const upstreamFresh = freshRate(
+    upstreamMetrics.tps,
+    upstreamMetrics.tpsAt,
+    now,
+  );
+  const swapFresh = freshRate(
+    swap.srvTps,
+    swap.srvTpsAt,
+    now,
+  );
+  return {
+    upstreamFresh,
+    swapFresh,
+    requestFresh:
+      perf.start > 0 &&
+      upstreamFresh &&
+      upstreamMetrics.tpsAt >= perf.start,
+    serverTps: upstreamFresh
+      ? upstreamMetrics.tps
+      : swap.srvTps,
+  };
 }
 
 function tokenRateRow(
@@ -2135,29 +2338,17 @@ function tokenRateRow(
 ): string {
   const active = perf.start > 0;
   const outputLive = active && perf.chars > 0;
-  const upstreamFresh =
-    upstreamMetrics.tps > 0 &&
-    upstreamMetrics.tpsAt > 0 &&
-    Date.now() - upstreamMetrics.tpsAt < SERVER_RATE_STALE_MS;
-  const swapFresh =
-    swap.srvTps > 0 && swap.srvTpsAt > 0 &&
-    Date.now() - swap.srvTpsAt < SERVER_RATE_STALE_MS;
-  const requestFresh =
-    active && upstreamFresh &&
-    upstreamMetrics.tpsAt >= perf.start;
-  const serverFresh = upstreamFresh || swapFresh;
-  const serverTps = upstreamFresh
-    ? upstreamMetrics.tps
-    : swap.srvTps;
+  const rates = tokenRateState(Date.now());
+  const serverFresh = rates.upstreamFresh || rates.swapFresh;
   let tps = perf.tps;
-  if (requestFresh) tps = upstreamMetrics.tps;
+  if (rates.requestFresh) tps = upstreamMetrics.tps;
   else if (active && outputLive) tps = liveTps();
   else if (active) tps = 0;
-  else if (serverFresh) tps = serverTps;
+  else if (serverFresh) tps = rates.serverTps;
   const tone: ThemeColor =
-    requestFresh || !outputLive ? "success" : "accent";
+    rates.requestFresh || !outputLive ? "success" : "accent";
   let suffix = "";
-  if (requestFresh) suffix = " server";
+  if (rates.requestFresh) suffix = " server";
   else if (outputLive) suffix = " ~live";
   else if (serverFresh) suffix = " server";
   const th = panel.theme;
@@ -2843,19 +3034,73 @@ const repaint = () => {
 };
 
 function rememberSelectionSection(data: string): void {
-  const match = data.match(
-    /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/,
-  );
-  if (!match || match[4] !== "M" || !tuiRef) return;
-  const button = Number(match[1]);
+  if (!data.startsWith("\x1b[<") || !tuiRef) return;
+  const release = data.endsWith("m");
+  if (release) return;
+  const fields = data.slice(3, -1).split(";");
+  if (fields.length !== 3) return;
+  const button = Number(fields[0]);
   if ((button & 3) !== 0 || (button & 32) !== 0) return;
-  const column = Number(match[2]);
+  const column = Number(fields[1]);
   const boundary = tuiRef.terminal.columns - panelWidth - 1;
   selectionSection =
     column >= boundary ? "panel" : "left";
 }
 
 let panelEnabled = true;
+let metricsTimer: ReturnType<typeof setInterval> | undefined;
+let unsubscribeInput: (() => void) | undefined;
+let lastPoll = 0;
+let titleTimer: ReturnType<typeof setInterval> | undefined;
+let liveTimer: ReturnType<typeof setInterval> | undefined;
+const runningTools = new Map<string, { name: string; target: string }>();
+
+function disableChrome(ctx: ExtensionContext): void {
+  if (ctx.mode !== "tui") return;
+  hidePanel();
+  ctx.ui.setWidget("pi-lens", undefined);
+  ctx.ui.setWidget("sidepanel-hook", undefined);
+  ctx.ui.setHeader(undefined);
+  ctx.ui.setFooter(undefined);
+  footerDataRef = undefined;
+}
+
+function applyChrome(ctx: ExtensionContext): void {
+  if (ctx.mode !== "tui") return;
+  if (!panelEnabled) {
+    disableChrome(ctx);
+    return;
+  }
+  ctx.ui.setWidget("pi-lens", undefined);
+  ctx.ui.setWidget(
+    "sidepanel-hook",
+    (tui: TUI, theme: Theme) => {
+      tuiRef = tui;
+      queueMicrotask(() => showPanel(theme));
+      return { render: () => [], invalidate: () => {} };
+    },
+  );
+  ctx.ui.setHeader(undefined);
+  ctx.ui.setFooter(
+    (
+      _tui: TUI,
+      _theme: Theme,
+      footerData: ReadonlyFooterDataProvider,
+    ) => {
+      footerDataRef = footerData;
+      const unsubscribeBranch = footerData.onBranchChange(
+        () => repaint(),
+      );
+      return {
+        render: () => [],
+        invalidate: () => {},
+        dispose: unsubscribeBranch,
+      };
+    },
+  );
+  ctx.ui.setTitle(windowTitle(ctx.cwd, titleDone));
+}
+
 interface NInferModelRecord {
   id?: string;
   owned_by?: string;
@@ -3396,113 +3641,113 @@ async function configureCost(
   );
 }
 
-export default async function (pi: ExtensionAPI) {
-  const sidepanelCfg = loadSidepanelConfig();
-  await discoverNinfer(pi, sidepanelCfg.ninfer);
-
-  ui.compact = sidepanelCfg.ui?.compact === true;
-  ui.kwhPrice = nonNegativeNumber(
-    sidepanelCfg.ui?.kwhPrice,
+function resetSessionView(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): void {
+  resetSessionState();
+  panelEnabled = true;
+  titleDone = false;
+  runningTools.clear();
+  liveCtx = ctx;
+  piLensState.currentFile = "";
+  piLensState.languages.clear();
+  piLensState.files.clear();
+  piLensState.technicalDebt = undefined;
+  piLensState.tdiRequested = false;
+  piLensState.available = pi.getCommands().some(
+    (command: { name: string }) =>
+      command.name?.replace(/^\/?/, "") === "lens-tdi",
   );
-  panelWidth = clampPanelWidth(
-    nonNegativeNumber(sidepanelCfg.ui?.panelWidth) ??
-      PANEL_WIDTH,
+  recountSession(ctx);
+  state.hasSmartCompact = pi.getCommands().some(
+    (command: { name: string }) =>
+      command.name?.replace(/^\/?/, "") === "smart-compact",
   );
-  ui.currency =
-    sidepanelCfg.ui?.currency === "USD" ? "USD" : "EUR";
-  swap.diskWh = nonNegativeNumber(sidepanelCfg.totalWh) ?? 0;
+}
 
-  const disableChrome = (ctx: ExtensionContext) => {
-    if (ctx.mode !== "tui") return;
-    hidePanel();
-    ctx.ui.setWidget("pi-lens", undefined);
-    ctx.ui.setWidget("sidepanel-hook", undefined);
-    ctx.ui.setHeader(undefined);
-    ctx.ui.setFooter(undefined);
-    footerDataRef = undefined;
-  };
-
-  const applyChrome = (ctx: ExtensionContext) => {
-    if (ctx.mode !== "tui") return;
-    if (!panelEnabled) {
-      disableChrome(ctx);
+function startSessionTimers(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): void {
+  applyChrome(ctx);
+  void probeModel(ctx).then(() => repaint()).catch(() => undefined);
+  if (piLensState.available && !piLensState.tdiRequested) {
+    installTdiNotificationCapture(ctx);
+    piLensState.tdiRequested = true;
+    pi.sendUserMessage("/lens-tdi", {
+      expandPromptTemplates: true,
+    });
+    repaint();
+  }
+  clearInterval(metricsTimer);
+  lastPoll = 0;
+  metricsTimer = setInterval(() => {
+    const now = Date.now();
+    if (!animating(now) && now - lastPoll < IDLE_POLL_MS)
       return;
-    }
-    ctx.ui.setWidget("pi-lens", undefined);
-    ctx.ui.setWidget(
-      "sidepanel-hook",
-      (tui: TUI, theme: Theme) => {
-        tuiRef = tui;
-        queueMicrotask(() => showPanel(theme));
-        return { render: () => [], invalidate: () => {} };
-      },
-    );
-    // Keep Pi's normal header; the side panel is the only custom chrome.
-    ctx.ui.setHeader(undefined);
-    ctx.ui.setFooter(
-      (
-        _tui: TUI,
-        _theme: Theme,
-        footerData: ReadonlyFooterDataProvider,
-      ) => {
-        footerDataRef = footerData;
-        const unsubscribeBranch = footerData.onBranchChange(
-          () => repaint(),
-        );
-        return {
-          render: () => [],
-          invalidate: () => {},
-          // Keep the provider reference even if another extension replaces
-          // this footer; it remains the shared source for extension statuses.
-          dispose: unsubscribeBranch,
-        };
-      },
-    );
-    ctx.ui.setTitle(windowTitle(ctx.cwd, titleDone));
-  };
+    lastPoll = now;
+    void Promise.all([
+      refreshSwapMetrics(),
+      refreshUpstreamMetrics(),
+    ])
+      .then(() => refreshSwapRunning())
+      .then(repaint);
+  }, BUSY_POLL_MS);
+  clearInterval(liveTimer);
+  liveTimer = setInterval(() => {
+    if (perf.start > 0 || state.phase !== "idle")
+      void refreshLiveContext().then(repaint);
+  }, LIVE_POLL_MS);
+}
 
-  let metricsTimer:
-    | ReturnType<typeof setInterval>
-    | undefined;
-  let unsubscribeInput: (() => void) | undefined;
-  let lastPoll = 0;
-  let titleTimer:
-    | ReturnType<typeof setInterval>
-    | undefined;
-  let liveTimer: ReturnType<typeof setInterval> | undefined;
-  const runningTools = new Map<
-    string,
-    { name: string; target: string }
-  >();
-  type PiLensEventHandler = Parameters<
-    typeof pi.events.on
-  >[1];
-  const onPiLensEvent: PiLensEventHandler =
-    (...args) => {
-      const decoded = decodeWireValue(
-        args[0] as WireValue,
+function bindSessionUi(ctx: ExtensionContext): void {
+  unsubscribeInput?.();
+  unsubscribeInput = ctx.ui.onTerminalInput((data: string) => {
+    rememberSelectionSection(data);
+    if (titleDone) {
+      titleDone = false;
+      ctx.ui.setTitle(windowTitle(ctx.cwd));
+    }
+    if (swap.state === "asleep" && liveCtx)
+      void preloadModel(liveCtx);
+    return undefined;
+  });
+  clearInterval(titleTimer);
+  titleTimer = setInterval(() => {
+    const current = liveCtx;
+    if (panelEnabled && current?.mode === "tui")
+      current.ui.setTitle(
+        windowTitle(current.cwd, titleDone),
       );
-      if (decoded !== undefined) {
-        const record = jsonObject(decoded);
-        let scalar = jsonString(decoded);
-        const number = jsonNumber(decoded);
-        if (!scalar && number !== undefined)
-          scalar = String(number);
-        let technicalDebt: string | undefined;
-        if (record) {
-          technicalDebt = piLensTdiFromRecord(record);
-        } else if (
-          scalar &&
-          isTechnicalDebtStatus("lens-tdi", scalar)
-        ) {
-          technicalDebt = scalar;
-        }
-        if (technicalDebt)
-          piLensState.technicalDebt = technicalDebt;
-        rememberPiLensEvent(decoded);
-      }
-      repaint();
-    };
+  }, TITLE_REFRESH_MS);
+}
+
+function handlePiLensEvent(...args: unknown[]): void {
+  const decoded = decodeWireValue(args[0] as WireValue);
+  if (decoded !== undefined) {
+    const record = jsonObject(decoded);
+    let scalar = jsonString(decoded);
+    const number = jsonNumber(decoded);
+    if (!scalar && number !== undefined)
+      scalar = String(number);
+    let technicalDebt: string | undefined;
+    if (record) {
+      technicalDebt = piLensTdiFromRecord(record);
+    } else if (
+      scalar &&
+      isTechnicalDebtStatus("lens-tdi", scalar)
+    ) {
+      technicalDebt = scalar;
+    }
+    if (technicalDebt)
+      piLensState.technicalDebt = technicalDebt;
+    rememberPiLensEvent(decoded);
+  }
+  repaint();
+}
+
+function registerPiLensEvents(pi: ExtensionAPI): void {
   for (const channel of [
     "pilens:files:touched",
     "pilens:format:start",
@@ -3516,329 +3761,227 @@ export default async function (pi: ExtensionAPI) {
     "pi-lens/tdi",
     "pi-lens/technical-debt",
   ]) {
-    pi.events.on(channel, onPiLensEvent);
+    pi.events.on(channel, handlePiLensEvent);
   }
+}
 
-  const resetSessionView = (
-    ctx: ExtensionContext,
-  ): void => {
-    resetSessionState();
-    panelEnabled = true;
-    titleDone = false;
-    runningTools.clear();
-    liveCtx = ctx;
-    piLensState.currentFile = "";
-      piLensState.languages.clear();
-      piLensState.files.clear();
-      piLensState.technicalDebt = undefined;
-      piLensState.tdiRequested = false;
-      piLensState.available = pi.getCommands().some(
-        (command: { name: string }) =>
-          command.name?.replace(/^\/?/, "") === "lens-tdi",
-      );
-    recountSession(ctx);
-    state.hasSmartCompact = pi.getCommands().some(
-      (command: { name: string }) =>
-        command.name?.replace(/^\/?/, "") ===
-        "smart-compact",
-    );
-  };
-
-  const startSessionTimers = (
-    ctx: ExtensionContext,
-  ): void => {
-    applyChrome(ctx);
-    void probeModel(ctx)
-      .then(() => repaint())
-      .catch(() => undefined);
-    if (piLensState.available && !piLensState.tdiRequested) {
-      installTdiNotificationCapture(ctx);
-      piLensState.tdiRequested = true;
-      pi.sendUserMessage("/lens-tdi", {
-        expandPromptTemplates: true,
-      });
+function registerSessionEvents(pi: ExtensionAPI): void {
+  pi.on(
+    "session_start",
+    (
+      _event: SessionStartEvent,
+      ctx: ExtensionContext,
+    ) => {
+      resetSessionView(pi, ctx);
+      if (ctx.mode !== "tui") return;
+      startSessionTimers(pi, ctx);
+      bindSessionUi(ctx);
+    },
+  );
+  pi.on(
+    "session_tree",
+    (
+      _event: SessionTreeEvent,
+      ctx: ExtensionContext,
+    ) => {
+      liveCtx = ctx;
+      recountSession(ctx);
       repaint();
-    }
-    clearInterval(metricsTimer);
-    lastPoll = 0;
-    metricsTimer = setInterval(() => {
-      const now = Date.now();
-      if (
-        !animating(now) &&
-        now - lastPoll < IDLE_POLL_MS
-      )
-        return;
-      lastPoll = now;
-      void Promise.all([
-        refreshSwapMetrics(),
-        refreshUpstreamMetrics(),
-      ])
-        .then(() => refreshSwapRunning())
-        .then(repaint);
-    }, BUSY_POLL_MS);
-    clearInterval(liveTimer);
-    liveTimer = setInterval(() => {
-      if (perf.start > 0 || state.phase !== "idle")
-        void refreshLiveContext().then(repaint);
-    }, LIVE_POLL_MS);
-  };
-
-  const bindSessionUi = (
-    ctx: ExtensionContext,
-  ): void => {
-    unsubscribeInput?.();
-    unsubscribeInput = ctx.ui.onTerminalInput((data: string) => {
-      rememberSelectionSection(data);
-      if (titleDone) {
-        titleDone = false;
-        ctx.ui.setTitle(windowTitle(ctx.cwd));
-      }
-      if (swap.state === "asleep" && liveCtx)
-        void preloadModel(liveCtx);
-      return undefined;
-    });
-    clearInterval(titleTimer);
-    titleTimer = setInterval(() => {
-      const current = liveCtx;
-      if (panelEnabled && current?.mode === "tui")
-        current.ui.setTitle(
-          windowTitle(current.cwd, titleDone),
+    },
+  );
+  pi.on(
+    "model_select",
+    (
+      event: ModelSelectEvent,
+      ctx: ExtensionContext,
+    ) => {
+      liveCtx = ctx;
+      perf.pps = 0;
+      if (ctx.mode === "tui")
+        void preloadModel(ctx, event.model).catch(
+          () => undefined,
         );
-    }, TITLE_REFRESH_MS);
-  };
+    },
+  );
+  pi.on("session_shutdown", () => {
+    persistEnergy(true);
+    clearInterval(metricsTimer);
+    metricsTimer = undefined;
+    unsubscribeInput?.();
+    unsubscribeInput = undefined;
+    clearInterval(titleTimer);
+    titleTimer = undefined;
+    clearInterval(liveTimer);
+    liveTimer = undefined;
+    runningTools.clear();
+    state.toolName = "";
+    state.toolTarget = "";
+    hidePanel();
+  });
+  pi.on("agent_start", () => {
+    state.runStart = Date.now();
+  });
+  pi.on(
+    "turn_start",
+    (
+      _event: TurnStartEvent,
+      ctx: ExtensionContext,
+    ) => {
+      liveCtx = ctx;
+      state.turns++;
+      setPhase("thinking");
+      repaint();
+    },
+  );
+}
 
-  const registerSessionEvents = (): void => {
-    pi.on(
-      "session_start",
-      (
-        _event: SessionStartEvent,
-        ctx: ExtensionContext,
-      ) => {
-        resetSessionView(ctx);
-        if (ctx.mode !== "tui") return;
-        startSessionTimers(ctx);
-        bindSessionUi(ctx);
-      },
-    );
+function registerMessageEvents(pi: ExtensionAPI): void {
+  pi.on(
+    "message_start",
+    (event: MessageStartEvent) => {
+      if (event.message.role !== "assistant") return;
+      perf.start = Date.now();
+      perf.first = 0;
+      perf.chars = 0;
+      perf.livePromptTokens = 0;
+      perf.liveOutputTokens = 0;
+      perf.pps = 0;
+      live.promptTokens = 0;
+      live.promptAt = 0;
+      live.promptPps = 0;
+      live.promptPpsServer = false;
+      live.promptTotal = 0;
+      live.promptProcessed = 0;
+      live.promptProgressKnown = false;
+      live.promptTotalEstimated = false;
+    },
+  );
+  pi.on(
+    "message_update",
+    (
+      event: MessageUpdateEvent,
+      ctx: ExtensionContext,
+    ) => {
+      liveCtx = ctx;
+      const streamEvent = event.assistantMessageEvent;
+      updateAssistantPhase(streamEvent);
+      updateAssistantTokenSamples(streamEvent);
+    },
+  );
+  pi.on("message_end", (event: MessageEndEvent) => {
+    if (event.message.role !== "assistant") return;
+    const message = event.message as AssistantMessage;
+    countAssistant(message);
+    recordAssistantPerformance(message);
+    repaint();
+    refreshMetricsAfterMessage();
+  });
+}
 
-    pi.on(
-      "session_tree",
-      (
-        _event: SessionTreeEvent,
-        ctx: ExtensionContext,
-      ) => {
-        liveCtx = ctx;
-        recountSession(ctx);
-        repaint();
-      },
-    );
-
-    pi.on(
-      "model_select",
-      (
-        event: ModelSelectEvent,
-        ctx: ExtensionContext,
-      ) => {
-        liveCtx = ctx;
-        perf.pps = 0;
-        if (ctx.mode === "tui")
-          void preloadModel(ctx, event.model).catch(
-            () => undefined,
-          );
-      },
-    );
-
-    pi.on("session_shutdown", () => {
-      persistEnergy(true);
-      clearInterval(metricsTimer);
-      metricsTimer = undefined;
-      unsubscribeInput?.();
-      unsubscribeInput = undefined;
-      clearInterval(titleTimer);
-      titleTimer = undefined;
-      clearInterval(liveTimer);
-      liveTimer = undefined;
+function registerToolEvents(pi: ExtensionAPI): void {
+  pi.on(
+    "tool_execution_start",
+    (
+      event: ToolExecutionStartEvent,
+      ctx: ExtensionContext,
+    ) => {
+      liveCtx = ctx;
+      const tool = {
+        name: event.toolName ?? "",
+        target: toolTarget(event.args),
+      };
+      if (/edit|write|patch/i.test(tool.name))
+        rememberPiLensEvent(event.args);
+      runningTools.set(event.toolCallId, tool);
+      setPhase("tool");
+      state.toolName = tool.name;
+      state.toolTarget = tool.target;
+      repaint();
+    },
+  );
+  pi.on(
+    "tool_execution_end",
+    (event: ToolExecutionEndEvent) => {
+      const tool = runningTools.get(event.toolCallId);
+      runningTools.delete(event.toolCallId);
+      if (event.isError) {
+        state.toolFail++;
+        state.lastFailAt = Date.now();
+        state.lastFailTool =
+          event.toolName ?? tool?.name ?? "tool";
+        state.lastFailTarget = tool?.target ?? "";
+      } else {
+        state.toolOk++;
+      }
+      const running = [...runningTools.values()][0];
+      if (running) {
+        state.toolName = running.name;
+        state.toolTarget = running.target;
+      } else {
+        setPhase("thinking");
+        state.toolName = "";
+        state.toolTarget = "";
+      }
+      repaint();
+    },
+  );
+  pi.on(
+    "agent_settled",
+    (
+      _event: AgentSettledEvent,
+      ctx: ExtensionContext,
+    ) => {
+      liveCtx = ctx;
+      if (state.runStart)
+        state.lastRunMs = Date.now() - state.runStart;
+      state.runStart = 0;
+      setPhase("idle");
       runningTools.clear();
       state.toolName = "";
       state.toolTarget = "";
-      hidePanel();
-    });
-
-    pi.on("agent_start", () => {
-      state.runStart = Date.now();
-    });
-
-    pi.on(
-      "turn_start",
-      (
-        _event: TurnStartEvent,
-        ctx: ExtensionContext,
-      ) => {
-        liveCtx = ctx;
-        state.turns++;
-        setPhase("thinking");
-        repaint();
-      },
-    );
-  };
-  registerSessionEvents();
-
-  const registerMessageEvents = (): void => {
-    pi.on(
-      "message_start",
-      (event: MessageStartEvent) => {
-        if (event.message.role !== "assistant") return;
-        perf.start = Date.now();
-        perf.first = 0;
-        perf.chars = 0;
-        perf.livePromptTokens = 0;
-        perf.liveOutputTokens = 0;
-        perf.pps = 0;
-        live.promptTokens = 0;
-        live.promptAt = 0;
-        live.promptPps = 0;
-        live.promptPpsServer = false;
-        live.promptTotal = 0;
-        live.promptProcessed = 0;
-        live.promptProgressKnown = false;
-        live.promptTotalEstimated = false;
-      },
-    );
-
-    pi.on(
-      "message_update",
-      (
-        event: MessageUpdateEvent,
-        ctx: ExtensionContext,
-      ) => {
-        liveCtx = ctx;
-        const streamEvent = event.assistantMessageEvent;
-        updateAssistantPhase(streamEvent);
-        updateAssistantTokenSamples(streamEvent);
-      },
-    );
-
-    pi.on("message_end", (event: MessageEndEvent) => {
-      if (event.message.role !== "assistant") return;
-      const message = event.message as AssistantMessage;
-      countAssistant(message);
-      recordAssistantPerformance(message);
+      if (state.lastRunMs > 30000) {
+        titleDone = true;
+        ctx.ui.setTitle(windowTitle(ctx.cwd, true));
+      }
       repaint();
-      refreshMetricsAfterMessage();
-    });
-  };
-  registerMessageEvents();
+    },
+  );
+}
 
-  const registerToolEvents = (): void => {
-    pi.on(
-      "tool_execution_start",
-      (
-        event: ToolExecutionStartEvent,
-        ctx: ExtensionContext,
-      ) => {
-        liveCtx = ctx;
-        const tool = {
-          name: event.toolName ?? "",
-          target: toolTarget(event.args),
-        };
-        if (/edit|write|patch/i.test(tool.name))
-          rememberPiLensEvent(event.args);
-        runningTools.set(event.toolCallId, tool);
-        setPhase("tool");
-        state.toolName = tool.name;
-        state.toolTarget = tool.target;
-        repaint();
-      },
-    );
-
-    pi.on(
-      "tool_execution_end",
-      (event: ToolExecutionEndEvent) => {
-        const tool = runningTools.get(event.toolCallId);
-        runningTools.delete(event.toolCallId);
-        if (event.isError) {
-          state.toolFail++;
-          state.lastFailAt = Date.now();
-          state.lastFailTool =
-            event.toolName ?? tool?.name ?? "tool";
-          state.lastFailTarget = tool?.target ?? "";
-        } else {
-          state.toolOk++;
-        }
-        const running = [...runningTools.values()][0];
-        if (running) {
-          state.toolName = running.name;
-          state.toolTarget = running.target;
-        } else {
-          setPhase("thinking");
-          state.toolName = "";
-          state.toolTarget = "";
-        }
-        repaint();
-      },
-    );
-
-    pi.on(
-      "agent_settled",
-      (
-        _event: AgentSettledEvent,
-        ctx: ExtensionContext,
-      ) => {
-        liveCtx = ctx;
-        if (state.runStart)
-          state.lastRunMs = Date.now() - state.runStart;
-        state.runStart = 0;
-        setPhase("idle");
-        runningTools.clear();
-        state.toolName = "";
-        state.toolTarget = "";
-        if (state.lastRunMs > 30000) {
-          titleDone = true;
-          ctx.ui.setTitle(windowTitle(ctx.cwd, true));
-        }
-        repaint();
-      },
-    );
-  };
-
-  const registerCompactionEvents = (): void => {
-    pi.on("session_before_compact", () => {
-      state.compacting = true;
-      state.compactSince = Date.now();
-      state.compactBy = state.hasSmartCompact
-        ? "smart-compact"
-        : "pi native";
-      repaint();
-    });
-
-    pi.on(
-      "session_compact",
-      (event: SessionCompactEvent) => {
-        state.compacting = false;
-        if (event.fromExtension) {
-          state.compactBy = state.hasSmartCompact
-            ? "smart-compact"
-            : "extension";
-        } else {
-          state.compactBy = "pi native";
-        }
-        repaint();
-      },
-    );
-
-    pi.on("session_compact_failed", () => {
+function registerCompactionEvents(pi: ExtensionAPI): void {
+  pi.on("session_before_compact", () => {
+    state.compacting = true;
+    state.compactSince = Date.now();
+    state.compactBy = state.hasSmartCompact
+      ? "smart-compact"
+      : "pi native";
+    repaint();
+  });
+  pi.on(
+    "session_compact",
+    (event: SessionCompactEvent) => {
       state.compacting = false;
+      if (event.fromExtension) {
+        state.compactBy = state.hasSmartCompact
+          ? "smart-compact"
+          : "extension";
+      } else {
+        state.compactBy = "pi native";
+      }
       repaint();
-    });
-  };
-  registerToolEvents();
-  registerCompactionEvents();
+    },
+  );
+  pi.on("session_compact_failed", () => {
+    state.compacting = false;
+    repaint();
+  });
+}
 
+function registerSidepanelCommand(pi: ExtensionAPI): void {
   const chromeActions: ChromeActions = {
     apply: applyChrome,
     disable: disableChrome,
   };
-
   pi.registerCommand("sidepanel", {
     description:
       "Manage the side panel: panel|compact|status|off|cost",
@@ -3857,13 +4000,12 @@ export default async function (pi: ExtensionAPI) {
           "electricity price and currency for the COST row",
         ],
       ];
-      const p = prefix.trimStart().toLowerCase();
-      const items = table.flatMap(([value, description]) =>
-        value.startsWith(p)
-          ? [{ value, label: value, description }]
+      const value = prefix.trimStart().toLowerCase();
+      return table.flatMap(([name, description]) =>
+        name.startsWith(value)
+          ? [{ value: name, label: name, description }]
           : [],
       );
-      return items.length ? items : null;
     },
     handler: async (
       args: string,
@@ -3903,4 +4045,31 @@ export default async function (pi: ExtensionAPI) {
       );
     },
   });
+}
+
+export default async function (pi: ExtensionAPI) {
+  const sidepanelCfg = loadSidepanelConfig();
+  await discoverNinfer(pi, sidepanelCfg.ninfer);
+
+  ui.compact = sidepanelCfg.ui?.compact === true;
+  ui.kwhPrice = nonNegativeNumber(
+    sidepanelCfg.ui?.kwhPrice,
+  );
+  panelWidth = clampPanelWidth(
+    nonNegativeNumber(sidepanelCfg.ui?.panelWidth) ??
+      PANEL_WIDTH,
+  );
+  ui.currency =
+    sidepanelCfg.ui?.currency === "USD" ? "USD" : "EUR";
+  swap.diskWh = nonNegativeNumber(sidepanelCfg.totalWh) ?? 0;
+
+  registerPiLensEvents(pi);
+
+  registerSessionEvents(pi);
+
+  registerMessageEvents(pi);
+  registerToolEvents(pi);
+  registerCompactionEvents(pi);
+
+  registerSidepanelCommand(pi);
 }
