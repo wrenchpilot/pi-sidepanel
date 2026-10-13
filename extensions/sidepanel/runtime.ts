@@ -443,11 +443,50 @@ let lastPoll = 0;
 let titleTimer: ReturnType<typeof setInterval> | undefined;
 let liveTimer: ReturnType<typeof setInterval> | undefined;
 const runningTools = new Map<string, { name: string; target: string }>();
+let restorePiLensWidgetGuard: (() => void) | undefined;
+
+function installPiLensWidgetGuard(ctx: ExtensionContext): void {
+  if (ctx.mode !== "tui") return;
+  const ui = ctx.ui;
+  if (!restorePiLensWidgetGuard) {
+    const setWidget = ui.setWidget;
+    const guardedSetWidget: typeof setWidget = (
+      key,
+      content,
+      options,
+    ) => {
+      if (key === "pi-lens") {
+        setWidget(key, undefined, options);
+      } else if (Array.isArray(content)) {
+        setWidget(key, content, options);
+      } else {
+        setWidget(key, content, options);
+      }
+    };
+    ui.setWidget = guardedSetWidget;
+    restorePiLensWidgetGuard = () => {
+      if (ui.setWidget === guardedSetWidget)
+        ui.setWidget = setWidget;
+      restorePiLensWidgetGuard = undefined;
+    };
+  }
+  ui.setWidget("pi-lens", undefined);
+}
+
+function hidePiLensWidget(ctx: ExtensionContext): void {
+  if (ctx.mode === "tui")
+    ctx.ui.setWidget("pi-lens", undefined);
+}
+
+function removePiLensWidgetGuard(): void {
+  restorePiLensWidgetGuard?.();
+}
 
 function disableChrome(ctx: ExtensionContext): void {
   if (ctx.mode !== "tui") return;
   hidePanel();
-  ctx.ui.setWidget("pi-lens", undefined);
+  hidePiLensWidget(ctx);
+  removePiLensWidgetGuard();
   ctx.ui.setWidget("sidepanel-hook", undefined);
   ctx.ui.setHeader(undefined);
   ctx.ui.setFooter(undefined);
@@ -460,7 +499,7 @@ function applyChrome(ctx: ExtensionContext): void {
     disableChrome(ctx);
     return;
   }
-  ctx.ui.setWidget("pi-lens", undefined);
+  installPiLensWidgetGuard(ctx);
   ctx.ui.setWidget(
     "sidepanel-hook",
     (tui: TUI, theme: Theme) => {
@@ -814,6 +853,9 @@ export function registerSessionEvents(pi: ExtensionAPI): void {
       ctx: ExtensionContext,
     ) => {
       liveCtx = ctx;
+      // Pi-Lens mounts its below-editor widget during session_start. Reassert
+      // ownership here after all session-start handlers have run.
+      hidePiLensWidget(ctx);
       recountSession(ctx);
       repaint();
     },
@@ -847,6 +889,7 @@ export function registerSessionEvents(pi: ExtensionAPI): void {
     state.toolName = "";
     state.toolTarget = "";
     hidePanel();
+    removePiLensWidgetGuard();
     tuiRef = undefined;
     liveCtx = undefined;
     footerDataRef = undefined;
