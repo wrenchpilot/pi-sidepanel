@@ -772,8 +772,8 @@ function parsePrometheusSamples(
 ): Map<string, number> {
   const samples = new Map<string, number>();
   const pattern =
-    /^\\s*([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\\{[^}]*\\})?\\s+([-+0-9.eE]+)(?:\\s+\\d+)?\\s*$/;
-  for (const line of text.split("\\n")) {
+    /^\s*([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([-+0-9.eE]+)(?:\s+\d+)?\s*$/;
+  for (const line of text.split("\n")) {
     if (line.startsWith("#")) continue;
     const match = pattern.exec(line);
     if (!match) continue;
@@ -1280,6 +1280,38 @@ async function refreshSwapActivity(): Promise<void> {
   }
 }
 
+let metricsCycleInFlight: Promise<void> | undefined;
+let metricsActivityPending = false;
+
+function refreshMetricsCycle(
+  includeActivity = false,
+): Promise<void> {
+  metricsActivityPending ||= includeActivity;
+  if (metricsCycleInFlight) return metricsCycleInFlight;
+  const runActivity = metricsActivityPending;
+  metricsActivityPending = false;
+
+  const operation = (async () => {
+    await Promise.all([
+      refreshSwapMetrics(),
+      refreshUpstreamMetrics(),
+    ]);
+    await refreshSwapRunning();
+    if (runActivity && swap.kind === "llama-swap")
+      await refreshSwapActivity();
+  })();
+  let tracked: Promise<void>;
+  tracked = operation.finally(() => {
+    if (metricsCycleInFlight === tracked) {
+      metricsCycleInFlight = undefined;
+      if (metricsActivityPending)
+        void refreshMetricsCycle().then(repaint);
+    }
+  });
+  metricsCycleInFlight = tracked;
+  return tracked;
+}
+
 /* ── live context ── */
 
 interface SwapSlotTimings {
@@ -1346,6 +1378,9 @@ function resetSwapObservation(): void {
 function resetSessionState(): void {
   sessionStart = Date.now();
   swapConnectionVersion++;
+  metricsCycleInFlight = undefined;
+  metricsActivityPending = false;
+  liveContextInFlight = undefined;
   resetSwapObservation();
   Object.assign(state, {
     phase: "idle" as Phase,
@@ -1558,7 +1593,7 @@ function updateLiveSlot(slot: SwapSlot, now: number): void {
   live.at = now;
 }
 
-async function refreshLiveContext(): Promise<void> {
+async function refreshLiveContextNow(): Promise<void> {
   if (swap.kind !== "llama-swap" || swap.state !== "ready")
     return;
   const version = swapConnectionVersion;
@@ -1581,6 +1616,21 @@ async function refreshLiveContext(): Promise<void> {
   } catch {
     // The previous estimate remains visible when the server is unavailable.
   }
+}
+
+let liveContextInFlight: Promise<void> | undefined;
+
+function refreshLiveContext(): Promise<void> {
+  if (liveContextInFlight) return liveContextInFlight;
+
+  const operation = refreshLiveContextNow();
+  let tracked: Promise<void>;
+  tracked = operation.finally(() => {
+    if (liveContextInFlight === tracked)
+      liveContextInFlight = undefined;
+  });
+  liveContextInFlight = tracked;
+  return tracked;
 }
 
 function contextUsage():
@@ -1683,9 +1733,7 @@ async function connectSwap(
     resetSwapObservation();
   swap.base = base;
   swap.headers = headers;
-  void refreshSwapMetrics();
-  void refreshUpstreamMetrics();
-  void refreshSwapActivity();
+  void refreshMetricsCycle(true);
   if (swap.kind === "ninfer") return true;
   // Use a snapshot: another model can be selected while the alias request is in flight.
   const get = (path: string) =>
@@ -1697,7 +1745,7 @@ async function connectSwap(
   )
     return false;
   swap.realId = aliases.get(id) ?? id;
-  void refreshSwapActivity();
+  void refreshMetricsCycle(true);
   return true;
 }
 
@@ -1831,8 +1879,7 @@ async function preloadModel(
   } finally {
     clearTimeout(slow);
     if (isCurrentSwap(version, id, base)) {
-      void refreshSwapMetrics();
-      void refreshUpstreamMetrics();
+      void refreshMetricsCycle();
     }
   }
 }
@@ -1958,14 +2005,15 @@ function locationRows(
 function extensionRows(
   panel: SidepanelPanel,
   inner: number,
+  statuses: Array<[string, string]>,
 ): string[] {
-  const statuses = extensionStatusEntries().filter(
+  const visibleStatuses = statuses.filter(
     ([key]) => !key.toLowerCase().startsWith("pi-lens"),
   );
-  if (!statuses.length) return [];
+  if (!visibleStatuses.length) return [];
   const out = [panelSep(panel, inner, "EXTENSIONS")];
   const valueWidth = Math.max(1, inner - 1);
-  for (const [, value] of statuses) {
+  for (const [, value] of visibleStatuses) {
     const wrapped = wrapTextWithAnsi(value, valueWidth);
     for (const line of wrapped)
       out.push(panelFrame(panel, ` ${line}`, inner));
@@ -2255,9 +2303,10 @@ function piLensStatusRows(
 function piLensRows(
   panel: SidepanelPanel,
   inner: number,
+  statuses: Array<[string, string]>,
 ): string[] {
-  const values = piLensStatusValues();
-  const technicalDebt = piLensTechnicalDebt();
+  const values = piLensStatusValues(statuses);
+  const technicalDebt = piLensTechnicalDebt(statuses);
   const languages = [...piLensState.languages]
     .sort((a, b) => a.localeCompare(b))
     .join(" ");
@@ -2629,7 +2678,6 @@ interface PanelCache {
 
 interface SidepanelPanel extends Component {
   theme: Theme;
-  frame: number;
   cache?: PanelCache;
   fillHeight?: () => number;
   invalidate(): void;
@@ -2667,12 +2715,13 @@ function renderSidepanelPanel(
     "border",
     "└" + "─".repeat(inner) + "┘",
   );
+  const statuses = extensionStatusEntries();
   const lines = [
     ...statusSection(panel, inner),
     ...locationRows(panel, inner),
     ...cache.lines,
-    ...extensionRows(panel, inner),
-    ...piLensRows(panel, inner),
+    ...extensionRows(panel, inner, statuses),
+    ...piLensRows(panel, inner, statuses),
   ];
   const target = (panel.fillHeight?.() ?? 0) - 1;
   while (lines.length < target)
@@ -2687,9 +2736,9 @@ function createSidepanelPanel(
   theme: Theme,
 ): SidepanelPanel {
   let timer: ReturnType<typeof setInterval> | null = null;
+  let lastRequestedAt = 0;
   const panel: SidepanelPanel = {
     theme,
-    frame: 0,
     cache: undefined,
     invalidate(): void {
       panel.cache = undefined;
@@ -2703,17 +2752,15 @@ function createSidepanelPanel(
     }
   };
   timer = setInterval(() => {
-    panel.frame++;
-    const cwd = displayPath(liveCtx?.cwd);
-    const cwdNeedsScroll =
-      visibleWidth(cwd) > panelWidth - 13;
+    const now = Date.now();
     if (
-      animating() ||
-      cwdNeedsScroll ||
-      panel.frame % 8 === 0
-    )
+      animating(now) ||
+      now - lastRequestedAt >= 1000
+    ) {
+      lastRequestedAt = now;
       tui.requestRender();
-  }, 125);
+    }
+  }, 250);
   return panel;
 }
 
@@ -2816,14 +2863,18 @@ function isPiLensStatus(key: string): boolean {
   );
 }
 
-function piLensTechnicalDebt(): string | undefined {
-  return extensionStatusEntries().find(([key, value]) =>
+function piLensTechnicalDebt(
+  statuses: Array<[string, string]>,
+): string | undefined {
+  return statuses.find(([key, value]) =>
     isTechnicalDebtStatus(key, value),
   )?.[1] ?? piLensState.technicalDebt;
 }
 
-function piLensStatusValues(): string[] {
-  return extensionStatusEntries().flatMap(([key, value]) =>
+function piLensStatusValues(
+  statuses: Array<[string, string]>,
+): string[] {
+  return statuses.flatMap(([key, value]) =>
     isPiLensStatus(key) &&
     !isTechnicalDebtStatus(key, value)
       ? [value]
@@ -3028,9 +3079,16 @@ const hidePanel = () => {
   panel = undefined;
 };
 
+let repaintQueued = false;
+
 const repaint = () => {
   panel?.invalidate();
-  tuiRef?.requestRender();
+  if (repaintQueued) return;
+  repaintQueued = true;
+  queueMicrotask(() => {
+    repaintQueued = false;
+    tuiRef?.requestRender();
+  });
 };
 
 function rememberSelectionSection(data: string): void {
@@ -3311,13 +3369,7 @@ function recordAssistantPerformance(
 
 function refreshMetricsAfterMessage(): void {
   setTimeout(() => {
-    const refreshes = [
-      refreshSwapMetrics(),
-      refreshUpstreamMetrics(),
-    ];
-    if (swap.kind === "llama-swap")
-      refreshes.push(refreshSwapActivity());
-    void Promise.all(refreshes).then(() => repaint());
+    void refreshMetricsCycle(true).then(repaint);
   }, 300);
 }
 
@@ -3434,10 +3486,9 @@ function buildSwapStatusLines(
   const byModel = new Map<string, ActivityRow[]>();
   for (const row of rows) {
     if (!row.model) continue;
-    byModel.set(row.model, [
-      ...(byModel.get(row.model) ?? []),
-      row,
-    ]);
+    const modelRows = byModel.get(row.model) ?? [];
+    modelRows.push(row);
+    byModel.set(row.model, modelRows);
   }
   for (const [model, modelRows] of byModel)
     lines.push(...buildSwapModelLines(ctx, model, modelRows));
@@ -3687,12 +3738,7 @@ function startSessionTimers(
     if (!animating(now) && now - lastPoll < IDLE_POLL_MS)
       return;
     lastPoll = now;
-    void Promise.all([
-      refreshSwapMetrics(),
-      refreshUpstreamMetrics(),
-    ])
-      .then(() => refreshSwapRunning())
-      .then(repaint);
+    void refreshMetricsCycle().then(repaint);
   }, BUSY_POLL_MS);
   clearInterval(liveTimer);
   liveTimer = setInterval(() => {
@@ -3813,10 +3859,16 @@ function registerSessionEvents(pi: ExtensionAPI): void {
     titleTimer = undefined;
     clearInterval(liveTimer);
     liveTimer = undefined;
+    metricsCycleInFlight = undefined;
+    metricsActivityPending = false;
+    liveContextInFlight = undefined;
     runningTools.clear();
     state.toolName = "";
     state.toolTarget = "";
     hidePanel();
+    tuiRef = undefined;
+    liveCtx = undefined;
+    footerDataRef = undefined;
   });
   pi.on("agent_start", () => {
     state.runStart = Date.now();

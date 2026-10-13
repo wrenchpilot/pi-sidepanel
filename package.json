@@ -1,5 +1,5 @@
 {
-  "name": "pi-sidepanel",
+  "name": "@wrenchpilot/pi-sidepanel",
   "version": "0.1.0",
   "description": "A Pi TUI extension that displays session, model, token, performance, Git, and local inference status in a side panel.",
   "type": "module",
@@ -12,11 +12,11 @@
   ],
   "license": "MIT",
   "homepage": "https://github.com/wrenchpilot/pi-sidepanel#readme",
-    "repository": {
+  "repository": {
     "type": "git",
     "url": "git+https://github.com/wrenchpilot/pi-sidepanel.git"
   },
-    "bugs": {
+  "bugs": {
     "url": "https://github.com/wrenchpilot/pi-sidepanel/issues"
   },
   "engines": {
@@ -29,7 +29,7 @@
     "package.json"
   ],
   "pi": {
-    "image": "https://raw.githubusercontent.com/wrenchpilot/pi-sidepanel/master/screenshots/pi-sidepanel.png",
+    "image": "https://raw.githubusercontent.com/wrenchpilot/pi-sidepanel/master/screenshot/pi-sidepanel.png",
     "extensions": [
       "./extensions/sidepanel.ts"
     ]

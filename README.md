@@ -13,13 +13,13 @@ This extension was extracted and adapted from the side panel in [b-iurea/pi-magi
 Install the published Pi package for persistent use:
 
 ```bash
-pi install npm:pi-sidepanel
+pi install npm:@wrenchpilot/pi-sidepanel
 ```
 
 To try it for one invocation without adding it to Pi's settings:
 
 ```bash
-pi -e npm:pi-sidepanel
+pi -e npm:@wrenchpilot/pi-sidepanel
 ```
 
 For local development, load the extension source directly:
@@ -33,13 +33,13 @@ The package contains the TypeScript source; Pi loads it directly and supplies it
 ## Panel sections
 
 - **Status** — current agent phase, tool activity, model loading, and context-compaction state.
-- **LOCATION** — home-relative `CWD` path and Git branch. Long paths marquee-scroll.
-- **PI-LENS** — detected languages, the current file being processed, and Pi-Lens LSP/status information. Long status and file lines marquee-scroll.
+- **LOCATION** — home-relative `CWD` path and Git branch. Long paths wrap within the panel.
+- **PI-LENS** — detected languages, the current file being processed, and Pi-Lens LSP/status information. Long status and file lines wrap within the panel.
 - **SESSION** — model, provider, and thinking level.
 - **TELEMETRY** — turns, token totals, cache reads, API cost, tool success rate, context-window usage, and hygiene counters.
 - **PERFORMANCE** — generation speed, prompt speed, KV-cache hit rate, TTFT, duration, and uptime.
 - **LLAMA-SWAP / NINFER** — model health, VRAM/GPU/RAM metrics, throughput, energy, and cost when the active provider supports them.
-- **EXTENSIONS** — status text published by any extension through `ctx.ui.setStatus()`. Long values marquee-scroll.
+- **EXTENSIONS** — status text published by any extension through `ctx.ui.setStatus()`. Long values wrap within the panel.
 
 The extension replaces the normal Pi footer and hides the Pi-Lens `belowEditor` widget so this information is presented in the side panel. Status text from other extensions is mirrored in the `EXTENSIONS` section. `/sidepanel off` restores Pi's built-in header and footer for the rest of the session.
 
