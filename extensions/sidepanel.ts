@@ -79,6 +79,7 @@ function animating(now = Date.now()): boolean {
     state.phase !== "idle" ||
     swap.state === "checking" ||
     swap.state === "loading" ||
+    swap.state === "error" ||
     (swap.state === "ready" &&
       now - swap.since < ONLINE_MS) ||
     state.compacting ||

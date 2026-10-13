@@ -16,6 +16,10 @@ const LIVE_STALE_MS = 5000;
 const MIN_PROMPT_SAMPLE_MS = 250;
 const ACTIVITY_CLOCK_SKEW_MS = 30000;
 
+function isTransientUpstreamStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504;
+}
+
 interface MonitorState {
   phase: "idle" | "thinking" | "responding" | "tool";
 }
@@ -562,7 +566,7 @@ async function refreshSwapMetrics(): Promise<void> {
 
 async function refreshSwapRunning(): Promise<void> {
   if (swap.kind === "ninfer") return refreshNinferHealth();
-  if (!swap.base || swap.state !== "ready") return;
+  if (!swap.base) return;
   const version = swapConnectionVersion;
   const modelId = swap.modelId;
   const base = swap.base;
@@ -572,11 +576,19 @@ async function refreshSwapRunning(): Promise<void> {
     const response = await swapFetch(base, headers, "/running");
     if (!response.ok) return;
     const { running } = (await response.json()) as {
-      running?: { model: string }[];
+      running?: { model: string; state?: string }[];
     };
     if (!isCurrentSwap(version, modelId, base)) return;
-    if (!(running ?? []).some((r) => r.model === realId))
+    const current = (running ?? []).find((r) => r.model === realId);
+    if (current?.state === "ready") {
+      if (swap.state !== "ready") setSwapState("ready");
+    } else if (current) {
+      // The server is reachable and the model is present, but it is still
+      // loading/busy. This is not an offline condition.
+      if (swap.state !== "loading") setSwapState("loading");
+    } else if (swap.state !== "asleep") {
       setSwapState("asleep");
+    }
   } catch {
     // optional
   }
@@ -1461,7 +1473,17 @@ export async function preloadModel(
       15 * 60000,
     );
     if (!isCurrentSwap(version, id, base)) return;
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      if (isTransientUpstreamStatus(res.status)) {
+        // llama-swap can answer 502/503/504 while its upstream model is
+        // loading or temporarily busy. The gateway is alive, so do not turn
+        // this into a sticky OFFLINE state. The /running poll below will
+        // promote the panel back to ready as soon as the model is available.
+        if (swap.state !== "ready") setSwapState("loading");
+        return;
+      }
+      throw new Error(`HTTP ${res.status}`);
+    }
     const loaded = swap.state === "loading";
     if (loaded) {
       swap.loadMs = Date.now() - started;
@@ -1485,7 +1507,9 @@ export async function preloadModel(
   } finally {
     clearTimeout(slow);
     if (isCurrentSwap(version, id, base)) {
-      void refreshMetricsCycle().catch(() => undefined);
+      void refreshMetricsCycle()
+        .then(() => repaint())
+        .catch(() => undefined);
     }
   }
 }
