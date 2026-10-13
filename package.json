@@ -26,8 +26,12 @@
     "extensions",
     "README.md",
     "LICENSE",
-    "package.json"
+    "package.json",
+    "screenshot"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "pi": {
     "image": "https://raw.githubusercontent.com/wrenchpilot/pi-sidepanel/master/screenshot/pi-sidepanel.png",
     "extensions": [
@@ -44,7 +48,7 @@
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "pack:check": "npm pack --dry-run",
     "prepack": "npm run check",
-    "prepublishOnly": "npm run check"
+    "prepublishOnly": "npm run check && npm test"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
