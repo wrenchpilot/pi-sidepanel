@@ -442,6 +442,7 @@ let unsubscribeInput: (() => void) | undefined;
 let lastPoll = 0;
 let titleTimer: ReturnType<typeof setInterval> | undefined;
 let liveTimer: ReturnType<typeof setInterval> | undefined;
+let tdiTimer: ReturnType<typeof setTimeout> | undefined;
 const runningTools = new Map<string, { name: string; target: string }>();
 let restorePiLensWidgetGuard: (() => void) | undefined;
 
@@ -791,14 +792,26 @@ function startSessionTimers(
 ): void {
   applyChrome(ctx);
   void probeModel(ctx).then(() => repaint()).catch(() => undefined);
+  clearTimeout(tdiTimer);
+  tdiTimer = undefined;
   if (piLensState.available && !piLensState.tdiRequested) {
     installTdiNotificationCapture(ctx);
     piLensState.tdiRequested = true;
-    pi.sendUserMessage("/lens-tdi", {
-      expandPromptTemplates: true,
-    });
-    repaint();
+    // Do not start a synthetic agent turn while session_start handlers are
+    // still initializing. Extensions such as herdr use agent_start and
+    // agent_settled to track the root session; firing here can make that
+    // startup turn look like the session exited.
+    tdiTimer = setTimeout(() => {
+      tdiTimer = undefined;
+      if (liveCtx !== ctx || ctx.mode !== "tui") return;
+      pi.sendUserMessage("/lens-tdi", {
+        expandPromptTemplates: true,
+      });
+      repaint();
+    }, 0);
   }
+  if (piLensState.available && piLensState.tdiRequested)
+    repaint();
   clearInterval(metricsTimer);
   lastPoll = 0;
   metricsTimer = setInterval(() => {
@@ -896,6 +909,8 @@ export function registerSessionEvents(pi: ExtensionAPI): void {
     titleTimer = undefined;
     clearInterval(liveTimer);
     liveTimer = undefined;
+    clearTimeout(tdiTimer);
+    tdiTimer = undefined;
     resetMonitorState();
     runningTools.clear();
     state.toolName = "";
