@@ -97,10 +97,11 @@ Install the development dependencies and run the checks before packing:
 ```bash
 npm install
 npm run check
+npm test
 npm run pack:check
 ```
 
-There is no separate build step. The published package intentionally contains `extensions/sidepanel.ts`, because Pi's package loader evaluates TypeScript extensions directly.
+There is no separate build step. The published package intentionally contains `extensions/sidepanel.ts`, because Pi's package loader evaluates TypeScript extensions directly. The entrypoint is intentionally small; focused modules under `extensions/sidepanel/` own runtime wiring, panel rendering, llama-swap monitoring, configuration, parsing, Pi-Lens state, NInfer discovery, activity reporting, and formatting.
 
 ## License
 

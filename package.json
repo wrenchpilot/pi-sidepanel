@@ -41,6 +41,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
     "pack:check": "npm pack --dry-run",
     "prepack": "npm run check",
     "prepublishOnly": "npm run check"
