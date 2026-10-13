@@ -1,6 +1,6 @@
 # Pi Side Panel
 
-A Pi TUI extension that replaces the default footer and Pi-Lens widget with a right-hand side panel for session, model, token, performance, Git, extension status, and local inference information.
+A Pi TUI extension that adds a right-hand side panel for session, model, token, performance, Git, extension footer content, and local inference information.
 
 This extension was extracted and adapted from the side panel in [b-iurea/pi-magi-theme](https://github.com/b-iurea/pi-magi-theme).
 
@@ -34,14 +34,13 @@ The package contains the TypeScript source; Pi loads it directly and supplies it
 
 - **Status** — current agent phase, tool activity, model loading, and context-compaction state.
 - **LOCATION** — home-relative `CWD` path and Git branch. Long paths wrap within the panel.
-- **PI-LENS** — detected languages, the current file being processed, and Pi-Lens LSP/status information. Long status and file lines wrap within the panel.
 - **SESSION** — model, provider, and thinking level.
 - **TELEMETRY** — turns, token totals, cache reads, API cost, tool success rate, context-window usage, and hygiene counters.
 - **PERFORMANCE** — generation speed, prompt speed, KV-cache hit rate, TTFT, duration, and uptime.
 - **LLAMA-SWAP / NINFER** — model health, VRAM/GPU/RAM metrics, throughput, energy, and cost when the active provider supports them.
-- **EXTENSIONS** — status text published by any extension through `ctx.ui.setStatus()`. Long values wrap within the panel.
+- **FOOTER** — footer status text, below-editor widgets, and custom footer components published by any extension. Long values wrap within the panel.
 
-The extension replaces the normal Pi footer and hides the Pi-Lens `belowEditor` widget so this information is presented in the side panel. Status text from other extensions is mirrored in the `EXTENSIONS` section. `/sidepanel off` restores Pi's built-in header and footer for the rest of the session.
+The sidepanel takes over Pi's normal footer area and mirrors its content in the `FOOTER` section. This includes extension status values, below-editor widgets, and custom footer components. `/sidepanel off` restores Pi's built-in header and footer for the rest of the session.
 
 ## Commands
 
@@ -88,7 +87,6 @@ Example:
 
 - Pi 1.1.0 or newer with TUI extension support
 - Node.js 22.19 or newer
-- Optional: Pi-Lens, llama-swap, or NInfer for their additional panel sections
 
 ## Development
 
@@ -100,8 +98,6 @@ npm run check
 npm test
 npm run pack:check
 ```
-
-There is no separate build step. The published package intentionally contains `extensions/sidepanel.ts`, because Pi's package loader evaluates TypeScript extensions directly. The entrypoint is intentionally small; focused modules under `extensions/sidepanel/` own runtime wiring, panel rendering, llama-swap monitoring, configuration, parsing, Pi-Lens state, NInfer discovery, activity reporting, and formatting.
 
 ## License
 

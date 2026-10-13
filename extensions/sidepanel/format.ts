@@ -1,3 +1,17 @@
+import { homedir } from "node:os";
+
+export function displayPath(target: string | undefined): string {
+  if (!target) return "—";
+  const home = homedir();
+  if (target === home) return "~";
+  if (
+    target.startsWith(`${home}/`) ||
+    target.startsWith(`${home}\\`)
+  )
+    return `~${target.slice(home.length)}`;
+  return target;
+}
+
 export function fmtTokens(n: number): string {
   if (n < 1000) return `${n}`;
   if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;

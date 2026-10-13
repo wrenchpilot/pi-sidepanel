@@ -63,9 +63,11 @@ export function activityDurations(
 }
 
 export function activityAgo(timestamp: string): string {
+  const parsed = Date.parse(timestamp);
+  if (!Number.isFinite(parsed)) return "—";
   const minutes = Math.max(
     0,
-    Math.round((Date.now() - Date.parse(timestamp)) / 60000),
+    Math.round((Date.now() - parsed) / 60000),
   );
   return minutes < 60
     ? `${minutes}m ago`

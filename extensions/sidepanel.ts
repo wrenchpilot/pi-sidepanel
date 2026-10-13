@@ -15,7 +15,6 @@ import {
   loadSidepanelConfig,
   nonNegativeNumber,
 } from "./sidepanel/config.js";
-import { registerPiLensEvents } from "./sidepanel/pilens.js";
 import { discoverNinfer } from "./sidepanel/ninfer.js";
 import {
   jsonObject,
@@ -24,7 +23,6 @@ import {
 } from "./sidepanel/wire.js";
 import {
   configureSidepanelRuntime,
-  repaintSidepanel,
   registerCompactionEvents,
   registerMessageEvents,
   registerSessionEvents,
@@ -130,8 +128,9 @@ const perf = {
 };
 
 function liveTps(): number {
-  if (state.phase !== "idle" && perf.first) {
-    const s = (Date.now() - perf.first) / 1000;
+  if (perf.start > 0 || state.phase !== "idle") {
+    const anchor = perf.first || perf.start;
+    const s = anchor ? (Date.now() - anchor) / 1000 : 0;
     if (s > 0.3) {
       const outputTokens =
         perf.liveOutputTokens > 0
@@ -140,6 +139,7 @@ function liveTps(): number {
       if (outputTokens > 0)
         return outputTokens / s;
     }
+    return 0;
   }
   return perf.tps;
 }
@@ -225,7 +225,6 @@ function resetSessionState(): void {
 
 export default async function (pi: ExtensionAPI) {
   const sidepanelCfg = loadSidepanelConfig();
-  await discoverNinfer(pi, sidepanelCfg.ninfer);
 
   ui.compact = sidepanelCfg.ui?.compact === true;
   ui.kwhPrice = nonNegativeNumber(
@@ -253,8 +252,6 @@ export default async function (pi: ExtensionAPI) {
     countAssistant,
   });
 
-  registerPiLensEvents(pi, repaintSidepanel);
-
   registerSessionEvents(pi);
 
   registerMessageEvents(pi);
@@ -262,4 +259,9 @@ export default async function (pi: ExtensionAPI) {
   registerCompactionEvents(pi);
 
   registerSidepanelCommand(pi);
+
+  // Register the synchronous session/UI wiring before waiting on optional
+  // remote model discovery so startup UI and footer status handling are not
+  // delayed by a network probe.
+  await discoverNinfer(pi, sidepanelCfg.ninfer);
 }

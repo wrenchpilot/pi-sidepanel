@@ -1,6 +1,6 @@
 {
   "name": "@wrenchpilot/pi-sidepanel",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "A Pi TUI extension that displays session, model, token, performance, Git, and local inference status in a side panel.",
   "type": "module",
   "keywords": [

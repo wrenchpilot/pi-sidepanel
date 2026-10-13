@@ -14,6 +14,7 @@ import {
 const LOAD_DEFAULT_MS = 60000;
 const LIVE_STALE_MS = 5000;
 const MIN_PROMPT_SAMPLE_MS = 250;
+const ACTIVITY_CLOCK_SKEW_MS = 30000;
 
 interface MonitorState {
   phase: "idle" | "thinking" | "responding" | "tool";
@@ -94,6 +95,7 @@ export const swap = {
   // these values in the performance panel.
   requestTps: 0,
   requestTpsAt: 0,
+  requestStartedAt: 0,
   requestPps: 0,
   requestPpsAt: 0,
   requestDurationMs: 0,
@@ -635,10 +637,12 @@ async function refreshSwapActivity(
 
     const rows = data ?? [];
     const timestampOf = (row: ActivityRow): number => {
-      const timestamp = row.timestamp
-        ? Date.parse(row.timestamp)
-        : Number.NaN;
-      return Number.isFinite(timestamp) ? timestamp : 0;
+      if (!row.timestamp) return 0;
+      const parsed = Date.parse(row.timestamp);
+      if (Number.isFinite(parsed)) return parsed;
+      const numeric = Number(row.timestamp);
+      if (!Number.isFinite(numeric)) return 0;
+      return numeric < 1e12 ? numeric * 1000 : numeric;
     };
     const matchingRows = rows.filter(
       (row) =>
@@ -654,7 +658,14 @@ async function refreshSwapActivity(
     if (!selectedRows.length) return;
     if (minTimestamp > 0) {
       selectedRows = selectedRows.filter(
-        (row) => timestampOf(row) >= minTimestamp,
+        (row) => {
+          const timestamp = timestampOf(row);
+          // A missing timestamp is still usable for older llama-swap builds.
+          // Timestamped rows must belong to this request; otherwise a delayed
+          // store response would make an older request look current.
+          return timestamp === 0 ||
+            timestamp >= minTimestamp - ACTIVITY_CLOCK_SKEW_MS;
+        },
       );
       if (!selectedRows.length) return;
     }
@@ -668,23 +679,23 @@ async function refreshSwapActivity(
     const latest = latestRow?.tokens;
     if (!latest) return;
     const observedAt = Date.now();
-    if (finiteNumber(latest.tokens_per_second)) {
-      swap.requestTps = Math.max(0, latest.tokens_per_second);
+    if (
+      finiteNumber(latest.tokens_per_second) &&
+      latest.tokens_per_second > 0
+    ) {
+      swap.requestTps = latest.tokens_per_second;
       swap.requestTpsAt = observedAt;
-      if (latest.tokens_per_second > 0) {
-        perf.tps = latest.tokens_per_second;
-        perf.tpsServer = true;
-        perf.peakTps = Math.max(
-          perf.peakTps,
-          latest.tokens_per_second,
-        );
-      }
+      perf.tps = swap.requestTps;
+      perf.tpsServer = true;
+      perf.peakTps = Math.max(perf.peakTps, swap.requestTps);
     }
-    if (finiteNumber(latest.prompt_per_second)) {
-      swap.requestPps = Math.max(0, latest.prompt_per_second);
+    if (
+      finiteNumber(latest.prompt_per_second) &&
+      latest.prompt_per_second > 0
+    ) {
+      swap.requestPps = latest.prompt_per_second;
       swap.requestPpsAt = observedAt;
-      if (latest.prompt_per_second > 0)
-        perf.pps = latest.prompt_per_second;
+      perf.pps = swap.requestPps;
     }
     if (
       finiteNumber(latestRow.duration_ms) &&
@@ -692,7 +703,7 @@ async function refreshSwapActivity(
     ) {
       swap.requestDurationMs = latestRow.duration_ms;
       swap.requestDurationAt = observedAt;
-      perf.lastMs = latestRow.duration_ms;
+      perf.lastMs = swap.requestDurationMs;
     }
     let updated = false;
     if (finiteNumber(latest.cache_tokens)) {
@@ -749,7 +760,9 @@ function startMetricsCycle(
     if (metricsCycleInFlight === tracked) {
       metricsCycleInFlight = undefined;
       if (metricsActivityPending)
-        void refreshMetricsCycle().then(repaint);
+        void refreshMetricsCycle()
+          .then(repaint)
+          .catch(() => undefined);
     }
   });
   metricsCycleInFlight = tracked;
@@ -777,19 +790,31 @@ interface SwapSlotTimings {
   predicted_per_second?: number;
 }
 
+interface SwapNextToken {
+  has_next_token?: boolean;
+  n_remain?: number;
+  n_decoded?: number;
+}
+
 interface SwapSlot {
   is_processing?: boolean;
+  id?: number;
+  id_task?: number;
   n_prompt_tokens?: number;
   n_prompt_tokens_processed?: number;
   n_prompt_tokens_cache?: number;
+  n_tokens_predicted?: number;
   n_ctx?: number;
   progress?: number;
-  next_token?: Array<{
-    has_next_token?: boolean;
-    n_remain?: number;
-    n_decoded?: number;
-  }>;
+  next_token?: SwapNextToken[] | SwapNextToken;
   timings?: SwapSlotTimings;
+}
+
+interface LiveSlotSample {
+  key: string;
+  promptTokens: number;
+  generatedTokens: number;
+  at: number;
 }
 
 export const live = {
@@ -802,11 +827,14 @@ export const live = {
   promptAt: 0,
   promptPps: 0,
   promptPpsServer: false,
+  promptProcessing: false,
   promptTotal: 0,
   promptProcessed: 0,
   promptProgressKnown: false,
   promptTotalEstimated: false,
 };
+
+let previousLiveSlotSample: LiveSlotSample | undefined;
 
 function resetSwapObservation(): void {
   resetUpstreamMetrics();
@@ -819,6 +847,7 @@ function resetSwapObservation(): void {
   swap.srvPpsAt = 0;
   swap.requestTps = 0;
   swap.requestTpsAt = 0;
+  swap.requestStartedAt = 0;
   swap.requestPps = 0;
   swap.requestPpsAt = 0;
   swap.requestDurationMs = 0;
@@ -838,10 +867,12 @@ function resetSwapObservation(): void {
   live.promptAt = 0;
   live.promptPps = 0;
   live.promptPpsServer = false;
+  live.promptProcessing = false;
   live.promptTotal = 0;
   live.promptProcessed = 0;
   live.promptProgressKnown = false;
   live.promptTotalEstimated = false;
+  previousLiveSlotSample = undefined;
 }
 
 export function resetMonitorState(): void {
@@ -853,19 +884,56 @@ export function resetMonitorState(): void {
   resetSwapObservation();
 }
 
+/** Mark the beginning of a response so an older activity row is never shown
+ * as the exact result for the new request. */
+export function beginRequestObservation(startedAt = Date.now()): void {
+  swap.requestStartedAt = startedAt;
+  previousLiveSlotSample = undefined;
+}
+
 function liveSlotProgress(slot: SwapSlot): number {
   if (finiteNumber(slot.n_prompt_tokens_processed))
-    return slot.n_prompt_tokens_processed;
-  return slot.n_prompt_tokens ?? 0;
+    return Math.max(0, slot.n_prompt_tokens_processed);
+  return 0;
+}
+
+function nextTokenStates(slot: SwapSlot): SwapNextToken[] {
+  if (Array.isArray(slot.next_token)) return slot.next_token;
+  return slot.next_token ? [slot.next_token] : [];
+}
+
+function liveSlotGeneratedTokens(slot: SwapSlot): number {
+  const decoded = nextTokenStates(slot).reduce(
+    (highest, token) =>
+      finiteNumber(token.n_decoded)
+        ? Math.max(highest, token.n_decoded)
+        : highest,
+    0,
+  );
+  const topLevel = finiteNumber(slot.n_tokens_predicted)
+    ? Math.max(0, slot.n_tokens_predicted)
+    : 0;
+  const timing = finiteNumber(slot.timings?.predicted_n)
+    ? Math.max(0, slot.timings.predicted_n)
+    : 0;
+  return Math.max(decoded, topLevel, timing);
+}
+
+function liveSlotKey(slot: SwapSlot): string {
+  if (finiteNumber(slot.id_task)) return `task:${slot.id_task}`;
+  if (finiteNumber(slot.id)) return `slot:${slot.id}`;
+  return "active";
 }
 
 function activeLiveSlot(slots: SwapSlot[]): SwapSlot | undefined {
-  const busy = slots.filter((slot) => {
-    if (slot.is_processing !== true) return false;
-    return liveSlotProgress(slot) > 0;
-  });
+  const busy = slots.filter((slot) => slot.is_processing === true);
   return busy.reduce<SwapSlot | undefined>((best, slot) => {
-    if (!best || liveSlotProgress(slot) > liveSlotProgress(best))
+    const progress =
+      liveSlotProgress(slot) + liveSlotGeneratedTokens(slot);
+    const bestProgress = best
+      ? liveSlotProgress(best) + liveSlotGeneratedTokens(best)
+      : -1;
+    if (!best || progress > bestProgress)
       return slot;
     return best;
   }, undefined);
@@ -893,7 +961,7 @@ function slotPromptTotal(slot: SwapSlot): number {
 }
 
 function slotPromptBudget(slot: SwapSlot): number {
-  const nRemain = slot.next_token?.[0]?.n_remain;
+  const nRemain = nextTokenStates(slot)[0]?.n_remain;
   if (
     !finiteNumber(slot.n_ctx) ||
     !finiteNumber(nRemain) ||
@@ -924,10 +992,10 @@ function promptFinished(
   promptBudget: number,
 ): boolean {
   const generationStarted =
-    slot.next_token?.some(
+    nextTokenStates(slot).some(
       (token) =>
         finiteNumber(token.n_decoded) && token.n_decoded > 0,
-    ) ?? false;
+    );
   if (generationStarted) return true;
   if (promptBudget > 0) return promptTokens >= promptBudget;
   return (
@@ -950,13 +1018,16 @@ function updateLivePromptProgress(
     promptBudget,
     reportedProgress,
   );
-  const finished = promptFinished(
+  // Once the assistant has emitted its first token, prompt ingestion is over
+  // even if the server's slot counters lag behind the stream.
+  const finished = perf.first > 0 || promptFinished(
     slot,
     promptTokens,
     promptBudget,
   );
   live.promptTotal = finished ? promptTokens : estimatedTotal;
   live.promptProcessed = promptTokens;
+  live.promptProcessing = !finished;
   live.promptProgressKnown = live.promptTotal > 0;
   live.promptTotalEstimated =
     !finished &&
@@ -984,46 +1055,87 @@ function updateLivePromptRate(
   slot: SwapSlot,
   promptTokens: number,
   now: number,
+  sample: LiveSlotSample,
+  promptIsFinished: boolean,
 ): void {
-  if (perf.first) return;
   const serverPps = slot.timings?.prompt_per_second;
   const timingPromptN = slot.timings?.prompt_n;
   const timingPromptMs = slot.timings?.prompt_ms;
-  if (finiteNumber(serverPps) && serverPps > 0) {
-    live.promptPps = serverPps;
-    live.promptPpsServer = true;
+  let rate = 0;
+  let server = false;
+  if (
+    !promptIsFinished &&
+    finiteNumber(serverPps) &&
+    serverPps > 0
+  ) {
+    rate = serverPps;
+    server = true;
   } else if (
+    !promptIsFinished &&
     finiteNumber(timingPromptN) &&
     finiteNumber(timingPromptMs) &&
     timingPromptN > 0 &&
     timingPromptMs > 0
   ) {
-    live.promptPps = timingPromptN / (timingPromptMs / 1000);
-    live.promptPpsServer = true;
-  } else if (live.promptAt && promptTokens < live.promptTokens) {
-    live.promptPps = 0;
-    live.promptPpsServer = false;
-  } else {
-    const elapsed = perf.start
-      ? (now - perf.start) / 1000
-      : 0;
+    rate = timingPromptN / (timingPromptMs / 1000);
+    server = true;
+  } else if (!promptIsFinished && promptTokens > 0) {
+    const previous =
+      previousLiveSlotSample?.key === sample.key
+        ? previousLiveSlotSample
+        : undefined;
+    const elapsed = previous
+      ? (now - previous.at) / 1000
+      : perf.start
+        ? (now - perf.start) / 1000
+        : 0;
+    const delta = previous
+      ? promptTokens - previous.promptTokens
+      : promptTokens;
     if (
       elapsed >= MIN_PROMPT_SAMPLE_MS / 1000 &&
-      promptTokens > 0
+      delta > 0
     ) {
-      live.promptPps = promptTokens / elapsed;
-      live.promptPpsServer = false;
+      rate = delta / elapsed;
     }
   }
   live.promptTokens = promptTokens;
-  live.promptAt = now;
+  if (rate > 0) {
+    live.promptPps = rate;
+    live.promptPpsServer = server;
+    live.promptAt = now;
+    // Preserve the latest known prompt rate when the next sample is delayed.
+    perf.pps = rate;
+  }
 }
 
 function updateLiveSlot(slot: SwapSlot, now: number): void {
   const promptTokens = liveSlotProgress(slot);
+  const generatedTokens = liveSlotGeneratedTokens(slot);
+  const sample: LiveSlotSample = {
+    key: liveSlotKey(slot),
+    promptTokens,
+    generatedTokens,
+    at: now,
+  };
+  const previous =
+    previousLiveSlotSample?.key === sample.key
+      ? previousLiveSlotSample
+      : undefined;
+  const promptIsFinished = perf.first > 0 || promptFinished(
+    slot,
+    promptTokens,
+    slotPromptBudget(slot),
+  );
   updateLivePromptProgress(slot, promptTokens);
   updateLiveCache(slot);
-  updateLivePromptRate(slot, promptTokens, now);
+  updateLivePromptRate(
+    slot,
+    promptTokens,
+    now,
+    sample,
+    promptIsFinished,
+  );
   const predictedN = slot.timings?.predicted_n;
   const predictedMs = slot.timings?.predicted_ms;
   let serverTps: number | undefined;
@@ -1046,6 +1158,28 @@ function updateLiveSlot(slot: SwapSlot, now: number): void {
     perf.tps = serverTps;
     perf.tpsServer = true;
     perf.peakTps = Math.max(perf.peakTps, serverTps);
+  } else {
+    const elapsed = previous
+      ? (now - previous.at) / 1000
+      : perf.first || perf.start
+        ? (now - (perf.first || perf.start)) / 1000
+        : 0;
+    const delta = previous
+      ? generatedTokens - previous.generatedTokens
+      : generatedTokens;
+    if (
+      generatedTokens > 0 &&
+      elapsed >= MIN_PROMPT_SAMPLE_MS / 1000 &&
+      delta > 0
+    ) {
+      const sampledTps = delta / elapsed;
+      live.tps = sampledTps;
+      live.tpsAt = now;
+      live.tpsServer = false;
+      perf.tps = sampledTps;
+      perf.tpsServer = false;
+      perf.peakTps = Math.max(perf.peakTps, sampledTps);
+    }
   }
   const serverTtft = slot.timings?.prompt_ms;
   if (finiteNumber(serverTtft) && serverTtft > 0) {
@@ -1056,6 +1190,7 @@ function updateLiveSlot(slot: SwapSlot, now: number): void {
     ? slot.n_prompt_tokens
     : promptTokens;
   live.at = now;
+  previousLiveSlotSample = sample;
 }
 
 async function refreshLiveContextNow(): Promise<void> {
@@ -1076,7 +1211,13 @@ async function refreshLiveContextNow(): Promise<void> {
     const slots = (await response.json()) as SwapSlot[];
     if (!isCurrentSwap(version, modelId, base)) return;
     const slot = activeLiveSlot(slots);
-    if (!slot) return;
+    if (!slot) {
+      // A missing active slot after output starts is normal between server
+      // samples. Do not leave the prompt progress bar looking active.
+      if (perf.first || state.phase === "responding")
+        live.promptProcessing = false;
+      return;
+    }
     updateLiveSlot(slot, Date.now());
   } catch {
     // The previous estimate remains visible when the server is unavailable.
@@ -1344,7 +1485,7 @@ export async function preloadModel(
   } finally {
     clearTimeout(slow);
     if (isCurrentSwap(version, id, base)) {
-      void refreshMetricsCycle();
+      void refreshMetricsCycle().catch(() => undefined);
     }
   }
 }

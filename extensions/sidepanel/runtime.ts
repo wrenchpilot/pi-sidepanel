@@ -3,6 +3,7 @@ import type {
   AgentSettledEvent,
   ExtensionAPI,
   ExtensionContext,
+  ExtensionWidgetOptions,
   MessageEndEvent,
   MessageStartEvent,
   MessageUpdateEvent,
@@ -20,19 +21,17 @@ import type { Component, TUI } from "@earendil-works/pi-tui";
 import { Container, HStack } from "@earendil-works/pi-tui";
 import { loadSidepanelConfig, saveSidepanelConfig, clampPanelWidth, MAX_PANEL_WIDTH, MIN_PANEL_WIDTH, PANEL_WIDTH } from "./config.js";
 import { showSwapStatus } from "./activity.js";
-import {
-  displayPath,
-  piLensState,
-  rememberPiLensEvent,
-} from "./pilens.js";
+import { displayPath } from "./format.js";
 import {
   configurePanelView,
   createSidepanelPanel,
+  type FooterWidgetSnapshot,
   type SidepanelPanel,
 } from "./panel-view.js";
 import {
   configureSwapMonitor,
   contextUsage,
+  beginRequestObservation,
   live,
   persistEnergy,
   preloadModel,
@@ -48,7 +47,7 @@ import {
 } from "./swap-monitor.js";
 import type { JsonObject } from "./wire.js";
 
-const LIVE_POLL_MS = 3000;
+const LIVE_POLL_MS = 1000;
 const BUSY_POLL_MS = 3000;
 const IDLE_POLL_MS = 30000;
 const TITLE_REFRESH_MS = 2000;
@@ -125,6 +124,43 @@ let countAssistant: SidepanelRuntimeDeps["countAssistant"];
 let liveCtx: ExtensionContext | undefined;
 let footerDataRef: ReadonlyFooterDataProvider | undefined;
 
+type FooterWidgetFactory = (
+  tui: TUI,
+  theme: Theme,
+) => Component & { dispose?(): void };
+
+type FooterFactory = (
+  tui: TUI,
+  theme: Theme,
+  footerData: ReadonlyFooterDataProvider,
+) => Component & { dispose?(): void };
+
+type FooterWidgetContent =
+  | string[]
+  | FooterWidgetFactory
+  | undefined;
+
+interface FooterWidgetEntry extends FooterWidgetSnapshot {
+  content: FooterWidgetContent;
+  options?: ExtensionWidgetOptions;
+}
+
+const footerWidgets = new Map<string, FooterWidgetEntry>();
+let customFooterFactory: FooterFactory | undefined;
+let customFooterLines: string[] = [];
+
+function footerWidgetSnapshots(): FooterWidgetSnapshot[] {
+  const snapshots: FooterWidgetSnapshot[] = [];
+  if (customFooterLines.length > 0)
+    snapshots.push({ key: "custom-footer", lines: [...customFooterLines] });
+  snapshots.push(
+    ...[...footerWidgets.values()]
+      .filter(({ lines }) => lines.length > 0)
+      .map(({ key, lines }) => ({ key, lines: [...lines] })),
+  );
+  return snapshots;
+}
+
 export const ui = {
   compact: false,
   kwhPrice: undefined as number | undefined,
@@ -168,6 +204,7 @@ export function configureSidepanelRuntime(
     getSessionStart,
     getLiveContext: () => liveCtx,
     getFooterData: () => footerDataRef,
+    getFooterWidgets: () => footerWidgetSnapshots(),
     animating: isAnimating,
     liveTps: currentLiveTps,
     contextUsage,
@@ -284,19 +321,18 @@ const showPanel = (theme: Theme) => {
   panel = createSidepanelPanel(tuiRef, theme);
   clampPromptSelection(tuiRef);
 
-  // SAFETY: tuiRef is a TUI instance; we access private layoutRoot/setLayoutRoot for fullscreen mode
+  // Fullscreen uses a private root that must be wrapped to reserve the
+  // sidepanel column. This is the original side-by-side layout path.
   const t = tuiRef as unknown as {
     mode: string;
     layoutRoot?: Component;
     setLayoutRoot: (root: Component) => void;
   };
-  if (
-    t.mode === "fullscreen" &&
-    t.layoutRoot
-  ) {
+  if (t.mode === "fullscreen" && t.layoutRoot) {
     panel.fillHeight = () => tuiRef?.terminal.rows ?? 0;
     wrappedRoot = t.layoutRoot;
-    t.setLayoutRoot(
+    t.setLayoutRoot.call(
+      tuiRef,
       new HStack(
         [
           {
@@ -373,11 +409,10 @@ const hidePanel = () => {
     regularRoot = undefined;
   }
   if (wrappedRoot && tuiRef) {
-    // SAFETY: wrappedRoot is only set after the fullscreen TUI exposes setLayoutRoot.
     const t = tuiRef as unknown as {
       setLayoutRoot?: (root: Component) => void;
     };
-    t.setLayoutRoot?.(wrappedRoot);
+    t.setLayoutRoot?.call(tuiRef, wrappedRoot);
     wrappedRoot = undefined;
   }
   panelHandle?.hide();
@@ -397,6 +432,171 @@ const repaint = () => {
     tuiRef?.requestRender();
   });
 };
+
+let footerWidgetUi: ExtensionContext["ui"] | undefined;
+let restoreFooterWidgetBridge: (() => void) | undefined;
+
+type FooterWidgetSetter = (
+  key: string,
+  content: FooterWidgetContent,
+  options?: ExtensionWidgetOptions,
+) => void;
+
+type FooterSetter = (factory: FooterFactory | undefined) => void;
+
+function panelFooterFactory(
+  _tui: TUI,
+  _theme: Theme,
+  footerData: ReadonlyFooterDataProvider,
+): Component & { dispose?(): void } {
+  footerDataRef = footerData;
+  const unsubscribeBranch = footerData.onBranchChange(() => repaint());
+  return {
+    render: () => [],
+    invalidate: () => {},
+    dispose: unsubscribeBranch,
+  };
+}
+
+/**
+ * Pi extensions commonly use a below-editor widget as part of the footer
+ * experience. Capture those widgets generically and render their lines in the
+ * sidepanel, while leaving above-editor widgets and the sidepanel mount alone.
+ */
+function installFooterWidgetBridge(ctx: ExtensionContext): void {
+  if (ctx.mode !== "tui") return;
+  const uiContext = ctx.ui;
+  if (footerWidgetUi === uiContext) return;
+  restoreFooterWidgetBridge?.();
+
+  const originalSetWidget = uiContext.setWidget;
+  const invokeSetWidget = originalSetWidget.bind(uiContext) as unknown as FooterWidgetSetter;
+  const originalSetFooter = uiContext.setFooter;
+  const invokeSetFooter = originalSetFooter.bind(uiContext) as unknown as FooterSetter;
+  const bridgedSetWidget = (
+    key: string,
+    content: FooterWidgetContent,
+    options?: ExtensionWidgetOptions,
+  ): void => {
+    if (
+      key === "sidepanel-hook" ||
+      options?.placement === "aboveEditor"
+    ) {
+      invokeSetWidget(key, content, options);
+      return;
+    }
+
+    if (content === undefined) {
+      footerWidgets.delete(key);
+      invokeSetWidget(key, content, options);
+      repaint();
+      return;
+    }
+
+    const entry: FooterWidgetEntry = {
+      key,
+      lines: Array.isArray(content) ? [...content] : [],
+      content,
+      options,
+    };
+    footerWidgets.set(key, entry);
+
+    if (Array.isArray(content)) {
+      // Keep the host widget mounted as an empty component so replacement and
+      // removal continue to follow Pi's normal widget lifecycle.
+      invokeSetWidget(key, [], options);
+      repaint();
+      return;
+    }
+
+    const nativeFactory = content;
+    invokeSetWidget(
+      key,
+      (tui: TUI, theme: Theme) => {
+        const native = nativeFactory(tui, theme);
+        return {
+          render(width: number): string[] {
+            const lines = native.render(width);
+            const changed =
+              lines.length !== entry.lines.length ||
+              lines.some((line, index) => line !== entry.lines[index]);
+            if (changed) {
+              entry.lines = [...lines];
+              repaint();
+            }
+            return [];
+          },
+          invalidate(): void {
+            native.invalidate();
+          },
+          dispose(): void {
+            native.dispose?.();
+          },
+        };
+      },
+      options,
+    );
+  };
+
+  const bridgedSetFooter = (factory: FooterFactory | undefined): void => {
+    // Keep the sidepanel's own blank footer as a lifecycle anchor without
+    // treating it as extension content to mirror.
+    if (factory === panelFooterFactory) {
+      invokeSetFooter(factory);
+      return;
+    }
+
+    customFooterFactory = factory;
+    customFooterLines = [];
+    if (factory === undefined) {
+      // The native footer stays suppressed while the sidepanel is active.
+      invokeSetFooter(panelFooterFactory);
+      repaint();
+      return;
+    }
+
+    invokeSetFooter((tui: TUI, theme: Theme, footerData: ReadonlyFooterDataProvider) => {
+      footerDataRef = footerData;
+      const native = factory(tui, theme, footerData);
+      return {
+        render(width: number): string[] {
+          const lines = native.render(width);
+          const changed =
+            lines.length !== customFooterLines.length ||
+            lines.some((line, index) => line !== customFooterLines[index]);
+          if (changed) {
+            customFooterLines = [...lines];
+            repaint();
+          }
+          return [];
+        },
+        invalidate(): void {
+          native.invalidate();
+        },
+        dispose(): void {
+          native.dispose?.();
+        },
+      };
+    });
+    repaint();
+  };
+
+  uiContext.setWidget = bridgedSetWidget as typeof uiContext.setWidget;
+  uiContext.setFooter = bridgedSetFooter as typeof uiContext.setFooter;
+  footerWidgetUi = uiContext;
+  restoreFooterWidgetBridge = () => {
+    for (const entry of footerWidgets.values())
+      invokeSetWidget(entry.key, entry.content, entry.options);
+    invokeSetFooter(customFooterFactory);
+    footerWidgets.clear();
+    customFooterFactory = undefined;
+    customFooterLines = [];
+    uiContext.setWidget = originalSetWidget;
+    uiContext.setFooter = originalSetFooter;
+    if (footerWidgetUi === uiContext) footerWidgetUi = undefined;
+    restoreFooterWidgetBridge = undefined;
+  };
+}
 
 function rememberSelectionSection(data: string): void {
   if (!data.startsWith("\x1b[<") || !tuiRef) return;
@@ -419,53 +619,15 @@ let lastPoll = 0;
 let titleTimer: ReturnType<typeof setInterval> | undefined;
 let liveTimer: ReturnType<typeof setInterval> | undefined;
 const runningTools = new Map<string, { name: string; target: string }>();
-let restorePiLensWidgetGuard: (() => void) | undefined;
-
-function installPiLensWidgetGuard(ctx: ExtensionContext): void {
-  if (ctx.mode !== "tui") return;
-  const ui = ctx.ui;
-  if (!restorePiLensWidgetGuard) {
-    const setWidget = ui.setWidget;
-    const guardedSetWidget: typeof setWidget = (
-      key,
-      content,
-      options,
-    ) => {
-      if (key === "pi-lens") {
-        setWidget(key, undefined, options);
-      } else if (Array.isArray(content)) {
-        setWidget(key, content, options);
-      } else {
-        setWidget(key, content, options);
-      }
-    };
-    ui.setWidget = guardedSetWidget;
-    restorePiLensWidgetGuard = () => {
-      if (ui.setWidget === guardedSetWidget)
-        ui.setWidget = setWidget;
-      restorePiLensWidgetGuard = undefined;
-    };
-  }
-  ui.setWidget("pi-lens", undefined);
-}
-
-function hidePiLensWidget(ctx: ExtensionContext): void {
-  if (ctx.mode === "tui")
-    ctx.ui.setWidget("pi-lens", undefined);
-}
-
-function removePiLensWidgetGuard(): void {
-  restorePiLensWidgetGuard?.();
-}
 
 function disableChrome(ctx: ExtensionContext): void {
   if (ctx.mode !== "tui") return;
+  const restoreBridge = restoreFooterWidgetBridge;
+  restoreBridge?.();
   hidePanel();
-  hidePiLensWidget(ctx);
-  removePiLensWidgetGuard();
   ctx.ui.setWidget("sidepanel-hook", undefined);
   ctx.ui.setHeader(undefined);
-  ctx.ui.setFooter(undefined);
+  if (!restoreBridge) ctx.ui.setFooter(undefined);
   footerDataRef = undefined;
 }
 
@@ -475,7 +637,7 @@ function applyChrome(ctx: ExtensionContext): void {
     disableChrome(ctx);
     return;
   }
-  installPiLensWidgetGuard(ctx);
+  installFooterWidgetBridge(ctx);
   ctx.ui.setWidget(
     "sidepanel-hook",
     (tui: TUI, theme: Theme) => {
@@ -485,23 +647,7 @@ function applyChrome(ctx: ExtensionContext): void {
     },
   );
   ctx.ui.setHeader(undefined);
-  ctx.ui.setFooter(
-    (
-      _tui: TUI,
-      _theme: Theme,
-      footerData: ReadonlyFooterDataProvider,
-    ) => {
-      footerDataRef = footerData;
-      const unsubscribeBranch = footerData.onBranchChange(
-        () => repaint(),
-      );
-      return {
-        render: () => [],
-        invalidate: () => {},
-        dispose: unsubscribeBranch,
-      };
-    },
-  );
+  ctx.ui.setFooter(panelFooterFactory);
   ctx.ui.setTitle(windowTitle(ctx.cwd, titleDone));
 }
 
@@ -550,6 +696,7 @@ function updateAssistantTokenSamples(
     perf.chars += event.delta.length;
   if (event && "partial" in event) {
     const usage = event.partial.usage;
+    if (!usage) return;
     const promptTokens =
       usage.input + usage.cacheRead + usage.cacheWrite;
     if (promptTokens > 0)
@@ -636,9 +783,16 @@ function recordAssistantPerformance(
 function refreshMetricsAfterMessage(
   messageTimestamp: number,
 ): void {
-  setTimeout(() => {
-    void refreshMetricsWithActivity(messageTimestamp).then(repaint);
-  }, 300);
+  // llama-swap writes the activity row after the response finishes. Retry a
+  // few times so a slow store flush does not leave the previous request on
+  // screen indefinitely.
+  for (const delay of [300, 900, 1800]) {
+    setTimeout(() => {
+      void refreshMetricsWithActivity(messageTimestamp)
+        .then(repaint)
+        .catch(() => undefined);
+    }, delay);
+  }
 }
 
 interface ChromeActions {
@@ -770,14 +924,6 @@ function resetSessionView(
   titleDone = false;
   runningTools.clear();
   liveCtx = ctx;
-  piLensState.currentFile = "";
-  piLensState.languages.clear();
-  piLensState.files.clear();
-  piLensState.technicalDebt = undefined;
-  piLensState.available = pi.getCommands().some(
-    (command: { name: string }) =>
-      command.name?.replace(/^\/?/, "") === "lens-tdi",
-  );
   recountSession(ctx);
   state.hasSmartCompact = pi.getCommands().some(
     (command: { name: string }) =>
@@ -797,12 +943,16 @@ function startSessionTimers(
     if (!animating(now) && now - lastPoll < IDLE_POLL_MS)
       return;
     lastPoll = now;
-    void refreshMetricsCycle().then(repaint);
+    void refreshMetricsCycle()
+      .then(repaint)
+      .catch(() => undefined);
   }, BUSY_POLL_MS);
   clearInterval(liveTimer);
   liveTimer = setInterval(() => {
     if (perf.start > 0 || state.phase !== "idle")
-      void refreshLiveContext().then(repaint);
+      void refreshLiveContext()
+        .then(repaint)
+        .catch(() => undefined);
   }, LIVE_POLL_MS);
 }
 
@@ -815,7 +965,7 @@ function bindSessionUi(ctx: ExtensionContext): void {
       ctx.ui.setTitle(windowTitle(ctx.cwd));
     }
     if (swap.state === "asleep" && liveCtx)
-      void preloadModel(liveCtx);
+      void preloadModel(liveCtx).catch(() => undefined);
     return undefined;
   });
   clearInterval(titleTimer);
@@ -848,9 +998,6 @@ export function registerSessionEvents(pi: ExtensionAPI): void {
       ctx: ExtensionContext,
     ) => {
       liveCtx = ctx;
-      // Pi-Lens mounts its below-editor widget during session_start. Reassert
-      // ownership here after all session-start handlers have run.
-      hidePiLensWidget(ctx);
       recountSession(ctx);
       repaint();
     },
@@ -885,7 +1032,7 @@ export function registerSessionEvents(pi: ExtensionAPI): void {
     state.toolName = "";
     state.toolTarget = "";
     hidePanel();
-    removePiLensWidgetGuard();
+    restoreFooterWidgetBridge?.();
     tuiRef = undefined;
     liveCtx = undefined;
     footerDataRef = undefined;
@@ -919,6 +1066,7 @@ export function registerMessageEvents(pi: ExtensionAPI): void {
       perf.liveOutputTokens = 0;
       perf.tpsServer = false;
       perf.ttftServer = false;
+      beginRequestObservation(perf.start);
       live.promptTokens = 0;
       live.promptAt = 0;
       live.tps = 0;
@@ -926,6 +1074,7 @@ export function registerMessageEvents(pi: ExtensionAPI): void {
       live.tpsServer = false;
       live.promptPps = 0;
       live.promptPpsServer = false;
+      live.promptProcessing = false;
       live.promptTotal = 0;
       live.promptProcessed = 0;
       live.promptProgressKnown = false;
@@ -949,6 +1098,7 @@ export function registerMessageEvents(pi: ExtensionAPI): void {
     const message = event.message as AssistantMessage;
     countAssistant(message);
     recordAssistantPerformance(message);
+    live.promptProcessing = false;
     repaint();
     refreshMetricsAfterMessage(message.timestamp);
   });
@@ -966,8 +1116,6 @@ export function registerToolEvents(pi: ExtensionAPI): void {
         name: event.toolName ?? "",
         target: toolTarget(event.args),
       };
-      if (/edit|write|patch/i.test(tool.name))
-        rememberPiLensEvent(event.args);
       runningTools.set(event.toolCallId, tool);
       setPhase("tool");
       state.toolName = tool.name;

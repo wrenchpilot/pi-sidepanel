@@ -12,19 +12,13 @@ import {
 } from "@earendil-works/pi-tui";
 import {
   bar,
+  displayPath,
   fmtMs,
   fmtTokens,
   secsSince,
   syncTone,
   usageTone,
 } from "./format.js";
-import {
-  displayPath,
-  emptyPiLensCounts,
-  isPiLensStatus,
-  isTechnicalDebtStatus,
-  piLensState,
-} from "./pilens.js";
 
 const FAIL_FLASH_MS = 2500;
 const ONLINE_MS = 3000;
@@ -74,6 +68,7 @@ interface PanelSwap {
   srvPpsAt: number;
   requestTps: number;
   requestTpsAt: number;
+  requestStartedAt: number;
   requestPps: number;
   requestPpsAt: number;
   requestDurationMs: number;
@@ -99,7 +94,9 @@ interface PanelLive {
   tpsAt: number;
   tpsServer: boolean;
   promptPps: number;
+  promptAt: number;
   promptPpsServer: boolean;
+  promptProcessing: boolean;
   promptTotal: number;
   promptProcessed: number;
   promptProgressKnown: boolean;
@@ -113,6 +110,7 @@ interface PanelPerf {
   livePromptTokens: number;
   liveOutputTokens: number;
   tps: number;
+  tpsServer: boolean;
   pps: number;
   ttft: number;
   lastMs: number;
@@ -139,6 +137,11 @@ interface PanelContextUsage {
   live: boolean;
 }
 
+export interface FooterWidgetSnapshot {
+  key: string;
+  lines: string[];
+}
+
 export interface PanelViewDeps {
   state: PanelState;
   swap: PanelSwap;
@@ -150,6 +153,7 @@ export interface PanelViewDeps {
   getSessionStart: () => number;
   getLiveContext: () => ExtensionContext | undefined;
   getFooterData: () => ReadonlyFooterDataProvider | undefined;
+  getFooterWidgets: () => FooterWidgetSnapshot[];
   animating: (now?: number) => boolean;
   liveTps: () => number;
   contextUsage: () => PanelContextUsage | undefined;
@@ -166,6 +170,7 @@ let ui: PanelUi;
 let getSessionStart = () => 0;
 let getLiveContext = () => undefined as ExtensionContext | undefined;
 let getFooterData = () => undefined as ReadonlyFooterDataProvider | undefined;
+let getFooterWidgets = () => [] as FooterWidgetSnapshot[];
 let animate = (_now?: number) => false;
 let currentLiveTps = () => 0;
 let currentContextUsage = () => undefined as PanelContextUsage | undefined;
@@ -182,6 +187,7 @@ export function configurePanelView(deps: PanelViewDeps): void {
   getSessionStart = deps.getSessionStart;
   getLiveContext = deps.getLiveContext;
   getFooterData = deps.getFooterData;
+  getFooterWidgets = deps.getFooterWidgets;
   animate = deps.animating;
   currentLiveTps = deps.liveTps;
   currentContextUsage = deps.contextUsage;
@@ -227,23 +233,23 @@ function extensionStatusEntries(): Array<[string, string]> {
   return entries.sort(([a], [b]) => a.localeCompare(b));
 }
 
-function piLensTechnicalDebt(
-  statuses: Array<[string, string]>,
-): string | undefined {
-  return statuses.find(([key, value]) =>
-    isTechnicalDebtStatus(key, value),
-  )?.[1] ?? piLensState.technicalDebt;
-}
-
-function piLensStatusValues(
+function footerRows(
+  panel: SidepanelPanel,
+  inner: number,
   statuses: Array<[string, string]>,
 ): string[] {
-  return statuses.flatMap(([key, value]) =>
-    isPiLensStatus(key) &&
-    !isTechnicalDebtStatus(key, value)
-      ? [value]
-      : [],
-  );
+  const values = [
+    ...statuses.map(([, value]) => value),
+    ...getFooterWidgets().flatMap(({ lines }) => lines),
+  ];
+  if (!values.length) return [];
+  const out = [panelSep(panel, inner, "FOOTER")];
+  const valueWidth = Math.max(1, inner - 1);
+  for (const value of values) {
+    for (const line of wrapTextWithAnsi(value, valueWidth))
+      out.push(panelFrame(panel, ` ${line}`, inner));
+  }
+  return out;
 }
 
 function panelPad(content: string, inner: number): string {
@@ -359,25 +365,6 @@ function locationRows(
       tone: "muted",
     }),
   );
-  return out;
-}
-
-function extensionRows(
-  panel: SidepanelPanel,
-  inner: number,
-  statuses: Array<[string, string]>,
-): string[] {
-  const visibleStatuses = statuses.filter(
-    ([key]) => !key.toLowerCase().startsWith("pi-lens"),
-  );
-  if (!visibleStatuses.length) return [];
-  const out = [panelSep(panel, inner, "EXTENSIONS")];
-  const valueWidth = Math.max(1, inner - 1);
-  for (const [, value] of visibleStatuses) {
-    const wrapped = wrapTextWithAnsi(value, valueWidth);
-    for (const line of wrapped)
-      out.push(panelFrame(panel, ` ${line}`, inner));
-  }
   return out;
 }
 
@@ -588,118 +575,6 @@ function telemetryRows(
   return out;
 }
 
-function piLensFileRows(
-  panel: SidepanelPanel,
-  inner: number,
-): string[] {
-  const out: string[] = [];
-  const files = [...piLensState.files.entries()].sort(
-    ([a], [b]) => a.localeCompare(b),
-  );
-  const currentFileHasIssues = files.some(
-    ([path]) =>
-      path === piLensState.currentFile ||
-      displayPath(path) === displayPath(piLensState.currentFile),
-  );
-  if (piLensState.currentFile && !currentFileHasIssues)
-    out.push(...panelFieldRows(panel, {
-      label: "FILE",
-      value: displayPath(piLensState.currentFile),
-      inner,
-      tone: "text",
-    }));
-  if (!files.length) return out;
-  const totals = files.reduce(
-    (sum, [, counts]) => ({
-      errors: sum.errors + counts.errors,
-      warnings: sum.warnings + counts.warnings,
-      info: sum.info + counts.info,
-    }),
-    emptyPiLensCounts(),
-  );
-  const totalParts = [
-    `${totals.errors} ${totals.errors === 1 ? "error" : "errors"}`,
-    `${totals.warnings} ${totals.warnings === 1 ? "warning" : "warnings"}`,
-  ];
-  if (totals.info) totalParts.push(`${totals.info} info`);
-  out.push(...panelFieldRows(panel, {
-    label: "ISSUES",
-    value: `${files.length} ${files.length === 1 ? "file" : "files"} · ${totalParts.join(" · ")}`,
-    inner,
-    tone: totals.errors ? "error" : "warning",
-  }));
-  for (const [path, counts] of files) {
-    const parts: string[] = [];
-    if (counts.errors) parts.push(`${counts.errors}E`);
-    if (counts.warnings) parts.push(`${counts.warnings}W`);
-    if (counts.info) parts.push(`${counts.info}I`);
-    let tone: ThemeColor = "muted";
-    if (counts.errors) tone = "error";
-    else if (counts.warnings) tone = "warning";
-    out.push(...panelFieldRows(panel, {
-      label: "FILE",
-      value: `${displayPath(path)} · ${parts.join(" ")}`,
-      inner,
-      tone,
-    }));
-  }
-  return out;
-}
-
-function piLensStatusRows(
-  panel: SidepanelPanel,
-  inner: number,
-  values: string[],
-): string[] {
-  const width = Math.max(1, inner - 1);
-  const out: string[] = [];
-  for (const value of values) {
-    for (const line of wrapTextWithAnsi(value, width))
-      out.push(panelFrame(panel, ` ${line}`, inner));
-  }
-  return out;
-}
-
-function piLensRows(
-  panel: SidepanelPanel,
-  inner: number,
-  statuses: Array<[string, string]>,
-): string[] {
-  const values = piLensStatusValues(statuses);
-  const technicalDebt = piLensTechnicalDebt(statuses);
-  const languages = [...piLensState.languages]
-    .sort((a, b) => a.localeCompare(b))
-    .join(" ");
-  const hasData =
-    piLensState.available ||
-    values.length > 0 ||
-    Boolean(technicalDebt) ||
-    Boolean(languages) ||
-    Boolean(piLensState.currentFile) ||
-    piLensState.files.size > 0;
-  if (!hasData) return [];
-  const out = [panelSep(panel, inner, "PI-LENS")];
-  if (languages)
-    out.push(...panelFieldRows(panel, {
-      label: "LANG",
-      value: languages,
-      inner,
-      tone: "muted",
-    }));
-  out.push(
-    ...piLensFileRows(panel, inner),
-    ...piLensStatusRows(panel, inner, values),
-  );
-  if (piLensState.available || technicalDebt)
-    out.push(...panelFieldRows(panel, {
-      label: "TDI",
-      value: technicalDebt ?? "—",
-      inner,
-      tone: technicalDebt ? "warning" : "muted",
-    }));
-  return out;
-}
-
 interface TokenRateState {
   upstreamFresh: boolean;
   swapFresh: boolean;
@@ -742,35 +617,38 @@ function tokenRateRow(
 ): string {
   const now = Date.now();
   const active = perf.start > 0;
-  const outputLive = active && perf.chars > 0;
+  const outputLive = active && (
+    perf.chars > 0 ||
+    perf.liveOutputTokens > 0
+  );
   const rates = tokenRateState(now);
   const serverFresh = rates.upstreamFresh || rates.swapFresh;
-  const liveServerFresh = live.tpsServer &&
+  const liveRateFresh =
     live.tps > 0 &&
     live.tpsAt > 0 &&
     now - live.tpsAt < LIVE_STALE_MS;
-  const exactRequest = !active && swap.requestTpsAt > 0;
+  const clientLiveTps = active && outputLive ? liveTps() : 0;
+  const exactRequest = !active &&
+    swap.requestTpsAt >= swap.requestStartedAt &&
+    swap.requestTpsAt > 0 &&
+    swap.requestTps > 0;
   let tps = 0;
   let suffix = "";
   let serverRate = false;
-  if (active && liveServerFresh) {
+  if (active && liveRateFresh) {
     tps = live.tps;
-    suffix = " server";
-    serverRate = true;
-  } else if (active && rates.upstreamFresh) {
-    // llama-server's upstream metric is authoritative while a request is
-    // running. Do not replace it with a slower client wall-clock estimate.
-    tps = upstreamMetrics.tps;
-    suffix = " server";
-    serverRate = true;
-  } else if (active && outputLive && !swap.kind) {
-    tps = liveTps();
+    suffix = live.tpsServer ? " server" : " ~live";
+    serverRate = live.tpsServer;
+  } else if (active && clientLiveTps > 0) {
+    tps = clientLiveTps;
     suffix = " ~live";
   } else if (active && perf.tps > 0) {
-    // Keep the previous completed value visible until this request produces
-    // a fresh measurement.
+    // Keep the last known result visible until a newer sample replaces it.
     tps = perf.tps;
-    suffix = " last";
+    suffix = perf.tpsServer ? " last" : " ~est";
+  } else if (active) {
+    // No performance result is available yet for this request.
+    tps = 0;
   } else if (exactRequest) {
     tps = swap.requestTps;
     suffix = " server";
@@ -783,6 +661,7 @@ function tokenRateRow(
     // Prefer Pi's reported output-token usage for non-server models. The
     // client-side duration is still not a llama-server timing.
     tps = perf.tps;
+    suffix = perf.tpsServer ? " last" : " ~est";
   } else if (serverFresh) {
     tps = rates.serverTps;
     suffix = " avg";
@@ -800,8 +679,8 @@ function tokenRateRow(
 
 function promptLiveNow(now: number): boolean {
   return live.promptPps > 0 &&
-    live.at > 0 &&
-    now - live.at < LIVE_STALE_MS;
+    live.promptAt > 0 &&
+    now - live.promptAt < LIVE_STALE_MS;
 }
 
 function upstreamPromptFresh(now: number): boolean {
@@ -832,8 +711,6 @@ function promptRateValue(
       pps: live.promptPps,
       suffix: live.promptPpsServer ? " server" : " ~live",
     };
-  if (active && upstreamFresh)
-    return { pps: upstreamMetrics.promptPps, suffix: " server" };
   if (liveEstimate) {
     const elapsed = (now - perf.start) / 1000;
     return {
@@ -844,7 +721,11 @@ function promptRateValue(
   if (active && perf.pps > 0)
     return { pps: perf.pps, suffix: " last" };
   if (active) return { pps: 0, suffix: "" };
-  if (swap.requestPpsAt > 0)
+  if (
+    swap.requestPpsAt >= swap.requestStartedAt &&
+    swap.requestPpsAt > 0 &&
+    swap.requestPps > 0
+  )
     return { pps: swap.requestPps, suffix: " server" };
   if (upstreamFresh)
     return { pps: upstreamMetrics.promptPps, suffix: " server" };
@@ -874,7 +755,7 @@ function promptProgressRow(
   panel: SidepanelPanel,
   inner: number,
 ): string {
-  if (live.promptProcessed <= 0)
+  if (perf.first || !live.promptProcessing || live.promptProcessed <= 0)
     return panelField(panel, {
       label: "PROGRESS",
       value: "—",
@@ -933,7 +814,11 @@ function performanceDetailRows(
   let duration = "—";
   if (perf.start)
     duration = fmtMs(Math.max(1, Date.now() - perf.start));
-  else if (swap.requestDurationAt && swap.requestDurationMs)
+  else if (
+    swap.requestDurationAt >= swap.requestStartedAt &&
+    swap.requestDurationAt > 0 &&
+    swap.requestDurationMs
+  )
     duration = fmtMs(swap.requestDurationMs);
   else if (perf.lastMs)
     duration = fmtMs(perf.lastMs);
@@ -1120,8 +1005,7 @@ export function renderSidepanelPanel(
     ...statusSection(panel, inner),
     ...locationRows(panel, inner),
     ...cache.lines,
-    ...extensionRows(panel, inner, statuses),
-    ...piLensRows(panel, inner, statuses),
+    ...footerRows(panel, inner, statuses),
   ];
   const target = (panel.fillHeight?.() ?? 0) - 1;
   while (lines.length < target)
