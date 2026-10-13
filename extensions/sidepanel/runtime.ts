@@ -600,10 +600,12 @@ function recordOutputRate(
   firstTokenMs: number,
   responseMs: number,
 ): void {
+  // Do not turn character count into a completed-response token count. It
+  // is useful for the explicitly-marked live estimate, but not for a final
+  // performance value.
   const outputTokens =
     message.usage?.output ||
-    perf.liveOutputTokens ||
-    perf.chars / 4;
+    perf.liveOutputTokens;
   const generationMs =
     firstTokenMs > 0 && firstTokenMs < responseMs
       ? responseMs - firstTokenMs
@@ -630,9 +632,11 @@ function recordAssistantPerformance(
   perf.start = 0;
 }
 
-function refreshMetricsAfterMessage(): void {
+function refreshMetricsAfterMessage(
+  messageTimestamp: number,
+): void {
   setTimeout(() => {
-    void refreshMetricsCycle(true).then(repaint);
+    void refreshMetricsCycle(true, messageTimestamp).then(repaint);
   }, 300);
 }
 
@@ -867,7 +871,15 @@ export function registerSessionEvents(pi: ExtensionAPI): void {
       ctx: ExtensionContext,
     ) => {
       liveCtx = ctx;
-      perf.pps = 0;
+      // Rates and timings belong to the selected model. Do not show the
+      // previous model's values while the new model is connecting.
+      Object.assign(perf, {
+        tps: 0,
+        pps: 0,
+        ttft: 0,
+        lastMs: 0,
+        peakTps: 0,
+      });
       if (ctx.mode === "tui")
         void preloadModel(ctx, event.model).catch(
           () => undefined,
@@ -924,6 +936,9 @@ export function registerMessageEvents(pi: ExtensionAPI): void {
       perf.pps = 0;
       live.promptTokens = 0;
       live.promptAt = 0;
+      live.tps = 0;
+      live.tpsAt = 0;
+      live.tpsServer = false;
       live.promptPps = 0;
       live.promptPpsServer = false;
       live.promptTotal = 0;
@@ -950,7 +965,7 @@ export function registerMessageEvents(pi: ExtensionAPI): void {
     countAssistant(message);
     recordAssistantPerformance(message);
     repaint();
-    refreshMetricsAfterMessage();
+    refreshMetricsAfterMessage(message.timestamp);
   });
 }
 

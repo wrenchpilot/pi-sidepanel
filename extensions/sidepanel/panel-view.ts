@@ -74,6 +74,12 @@ interface PanelSwap {
   srvTpsAt: number;
   srvPps: number;
   srvPpsAt: number;
+  requestTps: number;
+  requestTpsAt: number;
+  requestPps: number;
+  requestPpsAt: number;
+  requestDurationMs: number;
+  requestDurationAt: number;
   cacheTokens: number;
   inputTokens: number;
   kvKnown: boolean;
@@ -91,6 +97,9 @@ interface PanelUpstreamMetrics {
 interface PanelLive {
   tokens: number;
   at: number;
+  tps: number;
+  tpsAt: number;
+  tpsServer: boolean;
   promptPps: number;
   promptPpsServer: boolean;
   promptTotal: number;
@@ -696,7 +705,6 @@ function piLensRows(
 interface TokenRateState {
   upstreamFresh: boolean;
   swapFresh: boolean;
-  requestFresh: boolean;
   serverTps: number;
 }
 
@@ -724,10 +732,6 @@ function tokenRateState(now: number): TokenRateState {
   return {
     upstreamFresh,
     swapFresh,
-    requestFresh:
-      perf.start > 0 &&
-      upstreamFresh &&
-      upstreamMetrics.tpsAt >= perf.start,
     serverTps: upstreamFresh
       ? upstreamMetrics.tps
       : swap.srvTps,
@@ -738,21 +742,43 @@ function tokenRateRow(
   panel: SidepanelPanel,
   inner: number,
 ): string {
+  const now = Date.now();
   const active = perf.start > 0;
   const outputLive = active && perf.chars > 0;
-  const rates = tokenRateState(Date.now());
+  const rates = tokenRateState(now);
   const serverFresh = rates.upstreamFresh || rates.swapFresh;
-  let tps = perf.tps;
-  if (rates.requestFresh) tps = upstreamMetrics.tps;
-  else if (active && outputLive) tps = liveTps();
-  else if (active) tps = 0;
-  else if (serverFresh) tps = rates.serverTps;
-  const tone: ThemeColor =
-    rates.requestFresh || !outputLive ? "success" : "accent";
+  const liveServerFresh = live.tpsServer &&
+    live.tps > 0 &&
+    live.tpsAt > 0 &&
+    now - live.tpsAt < LIVE_STALE_MS;
+  const exactRequest = !active && swap.requestTpsAt > 0;
+  let tps = 0;
   let suffix = "";
-  if (rates.requestFresh) suffix = " server";
-  else if (outputLive) suffix = " ~live";
-  else if (serverFresh) suffix = " server";
+  let serverRate = false;
+  if (active && liveServerFresh) {
+    tps = live.tps;
+    suffix = " server";
+    serverRate = true;
+  } else if (active && outputLive) {
+    tps = liveTps();
+    suffix = " ~live";
+  } else if (active) {
+    tps = 0;
+  } else if (exactRequest) {
+    tps = swap.requestTps;
+    suffix = " server";
+    serverRate = true;
+  } else if (perf.tps > 0) {
+    // Prefer Pi's reported output-token usage for non-server models. The
+    // client-side duration is still not a llama-server timing.
+    tps = perf.tps;
+  } else if (serverFresh) {
+    tps = rates.serverTps;
+    suffix = " avg";
+    serverRate = true;
+  }
+  const tone: ThemeColor =
+    serverRate || !outputLive ? "success" : "accent";
   const th = panel.theme;
   return panelFrame(
     panel,
@@ -786,9 +812,6 @@ function promptRateValue(
   const promptLive = promptLiveNow(now);
   const upstreamFresh = upstreamPromptFresh(now);
   const swapFresh = swapPromptFresh(now);
-  const requestFresh = active &&
-    upstreamFresh &&
-    upstreamMetrics.promptPpsAt >= perf.start;
   const liveEstimate = active &&
     !promptLive &&
     !perf.first &&
@@ -798,8 +821,6 @@ function promptRateValue(
       pps: live.promptPps,
       suffix: live.promptPpsServer ? " server" : " ~live",
     };
-  if (requestFresh)
-    return { pps: upstreamMetrics.promptPps, suffix: " server" };
   if (liveEstimate) {
     const elapsed = (now - perf.start) / 1000;
     return {
@@ -808,11 +829,15 @@ function promptRateValue(
     };
   }
   if (active) return { pps: 0, suffix: "" };
+  if (swap.requestPpsAt > 0)
+    return { pps: swap.requestPps, suffix: " server" };
+  if (perf.pps > 0)
+    return { pps: perf.pps, suffix: " ~est" };
   if (upstreamFresh)
-    return { pps: upstreamMetrics.promptPps, suffix: "" };
+    return { pps: upstreamMetrics.promptPps, suffix: " avg" };
   if (swapFresh)
-    return { pps: swap.srvPps, suffix: "" };
-  return { pps: perf.pps, suffix: " ~est" };
+    return { pps: swap.srvPps, suffix: " avg" };
+  return { pps: 0, suffix: "" };
 }
 
 function promptRateRow(
@@ -833,9 +858,14 @@ function promptRateRow(
 function promptProgressRow(
   panel: SidepanelPanel,
   inner: number,
-): string | undefined {
-  if (perf.start <= 0 || live.promptProcessed <= 0)
-    return undefined;
+): string {
+  if (live.promptProcessed <= 0)
+    return panelField(panel, {
+      label: "PROGRESS",
+      value: "—",
+      inner,
+      tone: "muted",
+    });
   if (!live.promptProgressKnown || live.promptTotal <= 0)
     return panelField(panel, {
       label: "PROGRESS",
@@ -862,14 +892,15 @@ function performanceDetailRows(
 ): string[] {
   const out: string[] = [];
   const promptTotal = swap.cacheTokens + swap.inputTokens;
-  if (swap.kvKnown && promptTotal) {
-    out.push(panelField(panel, {
-      label: "KV CACHE",
-      value: `${fmtTokens(swap.cacheTokens)}/${fmtTokens(promptTotal)} hit ${Math.round((swap.cacheTokens / promptTotal) * 100)}%`,
-      inner,
-      tone: "muted",
-    }));
-  }
+  const cacheValue = swap.kvKnown && promptTotal
+    ? `${fmtTokens(swap.cacheTokens)}/${fmtTokens(promptTotal)} hit ${Math.round((swap.cacheTokens / promptTotal) * 100)}%`
+    : "—";
+  out.push(panelField(panel, {
+    label: "KV CACHE",
+    value: cacheValue,
+    inner,
+    tone: "muted",
+  }));
   out.push(
     panelField(panel, {
       label: "PEAK",
@@ -887,6 +918,8 @@ function performanceDetailRows(
   let duration = "—";
   if (perf.start)
     duration = fmtMs(Math.max(1, Date.now() - perf.start));
+  else if (swap.requestDurationAt && swap.requestDurationMs)
+    duration = fmtMs(swap.requestDurationMs);
   else if (perf.lastMs)
     duration = fmtMs(perf.lastMs);
   out.push(panelField(panel, {
@@ -915,8 +948,7 @@ function performanceRows(
     tokenRateRow(panel, inner),
     promptRateRow(panel, inner),
   ];
-  const progress = promptProgressRow(panel, inner);
-  if (progress) out.push(progress);
+  out.push(promptProgressRow(panel, inner));
   if (!compact) out.push(...performanceDetailRows(panel, inner));
   return out;
 }

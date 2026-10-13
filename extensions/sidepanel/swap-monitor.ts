@@ -14,7 +14,6 @@ import {
 const LOAD_DEFAULT_MS = 60000;
 const LIVE_STALE_MS = 5000;
 const MIN_PROMPT_SAMPLE_MS = 250;
-const MAX_ESTIMATED_PROMPT_PPS = 1_000_000;
 
 interface MonitorState {
   phase: "idle" | "thinking" | "responding" | "tool";
@@ -23,6 +22,10 @@ interface MonitorState {
 interface MonitorPerf {
   start: number;
   first: number;
+  tps: number;
+  pps: number;
+  lastMs: number;
+  peakTps: number;
 }
 
 let state: MonitorState;
@@ -83,6 +86,15 @@ export const swap = {
   srvTpsAt: 0,
   srvPps: 0,
   srvPpsAt: 0,
+  // Exact per-request values captured from llama-swap's activity log. The
+  // Prometheus gauges are server-wide averages, so they must not replace
+  // these values in the performance panel.
+  requestTps: 0,
+  requestTpsAt: 0,
+  requestPps: 0,
+  requestPpsAt: 0,
+  requestDurationMs: 0,
+  requestDurationAt: 0,
   cacheTokens: 0,
   inputTokens: 0,
   kvKnown: false,
@@ -303,6 +315,8 @@ interface SwapMetricAccumulator {
   gpus: Map<string, GpuStat>;
   ramUsed: number;
   ramTotal: number;
+  hasRamUsed: boolean;
+  hasRamTotal: boolean;
   srvTps: number;
   srvPps: number;
   cacheTokens: number;
@@ -335,6 +349,8 @@ function createSwapMetricAccumulator(): SwapMetricAccumulator {
     gpus: new Map(),
     ramUsed: 0,
     ramTotal: 0,
+    hasRamUsed: false,
+    hasRamTotal: false,
     srvTps: 0,
     srvPps: 0,
     cacheTokens: 0,
@@ -377,9 +393,11 @@ function updateSwapMetric(
   switch (metric.key) {
     case "memory_used_bytes":
       accumulator.ramUsed = metric.value;
+      accumulator.hasRamUsed = true;
       break;
     case "memory_total_bytes":
       accumulator.ramTotal = metric.value;
+      accumulator.hasRamTotal = true;
       break;
     case "last_tokens_per_second":
       if (metric.matchesModel)
@@ -410,16 +428,33 @@ function updateSwapMetric(
 function applySwapMetricAccumulator(
   accumulator: SwapMetricAccumulator,
 ): void {
-  swap.ramUsed = accumulator.ramUsed;
-  swap.ramTotal = accumulator.ramTotal;
+  // A successful but partial metrics response should not make hardware rows
+  // blink out of the panel. A model change explicitly resets these values.
+  if (accumulator.hasRamUsed)
+    swap.ramUsed = accumulator.ramUsed;
+  if (accumulator.hasRamTotal)
+    swap.ramTotal = accumulator.ramTotal;
   const now = Date.now();
   if (accumulator.srvTps > 0) {
     swap.srvTps = accumulator.srvTps;
     swap.srvTpsAt = now;
+    // NInfer exposes the last completed request directly in /metrics. Keep
+    // it as a request value too; unlike llama-swap it has no activity API.
+    if (swap.kind === "ninfer") {
+      swap.requestTps = accumulator.srvTps;
+      swap.requestTpsAt = now;
+      perf.tps = accumulator.srvTps;
+      perf.peakTps = Math.max(perf.peakTps, accumulator.srvTps);
+    }
   }
   if (accumulator.srvPps > 0) {
     swap.srvPps = accumulator.srvPps;
     swap.srvPpsAt = now;
+    if (swap.kind === "ninfer") {
+      swap.requestPps = accumulator.srvPps;
+      swap.requestPpsAt = now;
+      perf.pps = accumulator.srvPps;
+    }
   }
   if (accumulator.hasCacheTokens || accumulator.hasPromptTokens) {
     const nextCache = accumulator.hasCacheTokens
@@ -433,9 +468,11 @@ function applySwapMetricAccumulator(
       );
     swap.kvKnown = true;
   }
-  swap.gpus = [...accumulator.gpus.entries()]
-    .sort(([a], [b]) => Number(a) - Number(b))
-    .map(([, gpu]) => gpu);
+  if (accumulator.gpus.size) {
+    swap.gpus = [...accumulator.gpus.entries()]
+      .sort(([a], [b]) => Number(a) - Number(b))
+      .map(([, gpu]) => gpu);
+  }
 }
 
 function parseSwapMetrics(text: string): void {
@@ -558,7 +595,9 @@ async function refreshNinferHealth(): Promise<void> {
   }
 }
 
-async function refreshSwapActivity(): Promise<void> {
+async function refreshSwapActivity(
+  minTimestamp = 0,
+): Promise<void> {
   if (swap.kind === "ninfer") return refreshSwapMetrics();
   const version = swapConnectionVersion;
   const modelId = swap.modelId;
@@ -583,6 +622,12 @@ async function refreshSwapActivity(): Promise<void> {
       return;
 
     const rows = data ?? [];
+    const timestampOf = (row: ActivityRow): number => {
+      const timestamp = row.timestamp
+        ? Date.parse(row.timestamp)
+        : Number.NaN;
+      return Number.isFinite(timestamp) ? timestamp : 0;
+    };
     const matchingRows = rows.filter(
       (row) =>
         row.model === realId || row.model === modelId,
@@ -595,21 +640,47 @@ async function refreshSwapActivity(): Promise<void> {
     )
       selectedRows = rows;
     if (!selectedRows.length) return;
+    if (minTimestamp > 0) {
+      selectedRows = selectedRows.filter(
+        (row) => timestampOf(row) >= minTimestamp,
+      );
+      if (!selectedRows.length) return;
+    }
 
-    // Activity is used only for the latest request's cache counters. The
-    // Prometheus /metrics endpoint is authoritative for server throughput;
-    // averaging historical activity rows makes PROMPT/S and TOK/S wrong.
-    const timestampOf = (row: ActivityRow): number => {
-      const timestamp = row.timestamp
-        ? Date.parse(row.timestamp)
-        : Number.NaN;
-      return Number.isFinite(timestamp) ? timestamp : 0;
-    };
+    // The activity record is the authoritative per-request source. The
+    // Prometheus gauges are server-wide averages and must not overwrite the
+    // request rates shown in PERFORMANCE.
     const latestRow = [...selectedRows].sort(
       (a, b) => timestampOf(b) - timestampOf(a),
     )[0];
     const latest = latestRow?.tokens;
     if (!latest) return;
+    const observedAt = Date.now();
+    if (finiteNumber(latest.tokens_per_second)) {
+      swap.requestTps = Math.max(0, latest.tokens_per_second);
+      swap.requestTpsAt = observedAt;
+      if (latest.tokens_per_second > 0) {
+        perf.tps = latest.tokens_per_second;
+        perf.peakTps = Math.max(
+          perf.peakTps,
+          latest.tokens_per_second,
+        );
+      }
+    }
+    if (finiteNumber(latest.prompt_per_second)) {
+      swap.requestPps = Math.max(0, latest.prompt_per_second);
+      swap.requestPpsAt = observedAt;
+      if (latest.prompt_per_second > 0)
+        perf.pps = latest.prompt_per_second;
+    }
+    if (
+      finiteNumber(latestRow.duration_ms) &&
+      latestRow.duration_ms > 0
+    ) {
+      swap.requestDurationMs = latestRow.duration_ms;
+      swap.requestDurationAt = observedAt;
+      perf.lastMs = latestRow.duration_ms;
+    }
     let updated = false;
     if (finiteNumber(latest.cache_tokens)) {
       swap.cacheTokens = Math.max(
@@ -633,14 +704,24 @@ async function refreshSwapActivity(): Promise<void> {
 
 let metricsCycleInFlight: Promise<void> | undefined;
 let metricsActivityPending = false;
+let metricsActivityAfter = 0;
 
 export function refreshMetricsCycle(
   includeActivity = false,
+  activityAfter = 0,
 ): Promise<void> {
-  metricsActivityPending ||= includeActivity;
+  if (includeActivity) {
+    metricsActivityPending = true;
+    metricsActivityAfter = Math.max(
+      metricsActivityAfter,
+      activityAfter,
+    );
+  }
   if (metricsCycleInFlight) return metricsCycleInFlight;
   const runActivity = metricsActivityPending;
+  const runActivityAfter = metricsActivityAfter;
   metricsActivityPending = false;
+  metricsActivityAfter = 0;
 
   const operation = (async () => {
     await Promise.all([
@@ -649,7 +730,7 @@ export function refreshMetricsCycle(
     ]);
     await refreshSwapRunning();
     if (runActivity && swap.kind === "llama-swap")
-      await refreshSwapActivity();
+      await refreshSwapActivity(runActivityAfter);
   })();
   let tracked: Promise<void>;
   tracked = operation.finally(() => {
@@ -669,6 +750,9 @@ interface SwapSlotTimings {
   prompt_n?: number;
   prompt_ms?: number;
   prompt_per_second?: number;
+  predicted_n?: number;
+  predicted_ms?: number;
+  predicted_per_second?: number;
 }
 
 interface SwapSlot {
@@ -689,6 +773,9 @@ interface SwapSlot {
 export const live = {
   tokens: 0,
   at: 0,
+  tps: 0,
+  tpsAt: 0,
+  tpsServer: false,
   promptTokens: 0,
   promptAt: 0,
   promptPps: 0,
@@ -708,6 +795,12 @@ function resetSwapObservation(): void {
   swap.srvTpsAt = 0;
   swap.srvPps = 0;
   swap.srvPpsAt = 0;
+  swap.requestTps = 0;
+  swap.requestTpsAt = 0;
+  swap.requestPps = 0;
+  swap.requestPpsAt = 0;
+  swap.requestDurationMs = 0;
+  swap.requestDurationAt = 0;
   swap.cacheTokens = 0;
   swap.inputTokens = 0;
   swap.kvKnown = false;
@@ -716,6 +809,9 @@ function resetSwapObservation(): void {
   swap.lastWatts = 0;
   live.tokens = 0;
   live.at = 0;
+  live.tps = 0;
+  live.tpsAt = 0;
+  live.tpsServer = false;
   live.promptTokens = 0;
   live.promptAt = 0;
   live.promptPps = 0;
@@ -730,6 +826,7 @@ export function resetMonitorState(): void {
   swapConnectionVersion++;
   metricsCycleInFlight = undefined;
   metricsActivityPending = false;
+  metricsActivityAfter = 0;
   liveContextInFlight = undefined;
   resetSwapObservation();
 }
@@ -905,6 +1002,12 @@ function updateLiveSlot(slot: SwapSlot, now: number): void {
   updateLivePromptProgress(slot, promptTokens);
   updateLiveCache(slot);
   updateLivePromptRate(slot, promptTokens, now);
+  const serverTps = slot.timings?.predicted_per_second;
+  if (finiteNumber(serverTps) && serverTps > 0) {
+    live.tps = serverTps;
+    live.tpsAt = now;
+    live.tpsServer = true;
+  }
   live.tokens = finiteNumber(slot.n_prompt_tokens)
     ? slot.n_prompt_tokens
     : promptTokens;
