@@ -121,8 +121,10 @@ const perf = {
   livePromptTokens: 0,
   liveOutputTokens: 0,
   tps: 0,
+  tpsServer: false,
   pps: 0,
   ttft: 0,
+  ttftServer: false,
   lastMs: 0,
   peakTps: 0,
 };
@@ -212,8 +214,10 @@ function resetSessionState(): void {
     livePromptTokens: 0,
     liveOutputTokens: 0,
     tps: 0,
+    tpsServer: false,
     pps: 0,
     ttft: 0,
+    ttftServer: false,
     lastMs: 0,
     peakTps: 0,
   });

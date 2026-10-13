@@ -757,13 +757,26 @@ function tokenRateRow(
     tps = live.tps;
     suffix = " server";
     serverRate = true;
-  } else if (active && outputLive) {
+  } else if (active && rates.upstreamFresh) {
+    // llama-server's upstream metric is authoritative while a request is
+    // running. Do not replace it with a slower client wall-clock estimate.
+    tps = upstreamMetrics.tps;
+    suffix = " server";
+    serverRate = true;
+  } else if (active && outputLive && !swap.kind) {
     tps = liveTps();
     suffix = " ~live";
-  } else if (active) {
-    tps = 0;
+  } else if (active && perf.tps > 0) {
+    // Keep the previous completed value visible until this request produces
+    // a fresh measurement.
+    tps = perf.tps;
+    suffix = " last";
   } else if (exactRequest) {
     tps = swap.requestTps;
+    suffix = " server";
+    serverRate = true;
+  } else if (rates.upstreamFresh) {
+    tps = upstreamMetrics.tps;
     suffix = " server";
     serverRate = true;
   } else if (perf.tps > 0) {
@@ -819,6 +832,8 @@ function promptRateValue(
       pps: live.promptPps,
       suffix: live.promptPpsServer ? " server" : " ~live",
     };
+  if (active && upstreamFresh)
+    return { pps: upstreamMetrics.promptPps, suffix: " server" };
   if (liveEstimate) {
     const elapsed = (now - perf.start) / 1000;
     return {
@@ -826,13 +841,15 @@ function promptRateValue(
       suffix: " ~live",
     };
   }
+  if (active && perf.pps > 0)
+    return { pps: perf.pps, suffix: " last" };
   if (active) return { pps: 0, suffix: "" };
   if (swap.requestPpsAt > 0)
     return { pps: swap.requestPps, suffix: " server" };
+  if (upstreamFresh)
+    return { pps: upstreamMetrics.promptPps, suffix: " server" };
   if (perf.pps > 0)
     return { pps: perf.pps, suffix: " ~est" };
-  if (upstreamFresh)
-    return { pps: upstreamMetrics.promptPps, suffix: " avg" };
   if (swapFresh)
     return { pps: swap.srvPps, suffix: " avg" };
   return { pps: 0, suffix: "" };

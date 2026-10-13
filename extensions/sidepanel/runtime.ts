@@ -82,8 +82,10 @@ interface RuntimePerf {
   livePromptTokens: number;
   liveOutputTokens: number;
   tps: number;
+  tpsServer: boolean;
   pps: number;
   ttft: number;
+  ttftServer: boolean;
   lastMs: number;
   peakTps: number;
 }
@@ -183,31 +185,6 @@ export function repaintSidepanel(): void {
 
 function animating(now = Date.now()): boolean {
   return isAnimating(now);
-}
-
-const tdiNotifyWrapped = new WeakSet<object>();
-
-function captureTdiNotification(message: string): void {
-  const match = message.match(
-    /technical debt index:\s*([0-9]+(?:\.[0-9]+)?\/100(?:\s*\([^\n)]+\))?)/i,
-  );
-  if (match?.[1]) {
-    piLensState.technicalDebt = match[1];
-    repaint();
-  }
-}
-
-function installTdiNotificationCapture(
-  ctx: ExtensionContext,
-): void {
-  const ui = ctx.ui;
-  if (tdiNotifyWrapped.has(ui)) return;
-  const notify = ui.notify.bind(ui);
-  ui.notify = (message, type) => {
-    captureTdiNotification(message);
-    notify(message, type);
-  };
-  tdiNotifyWrapped.add(ui);
 }
 
 /* ──────────────────────────────────────────────────────── extension ── */
@@ -441,7 +418,6 @@ let unsubscribeInput: (() => void) | undefined;
 let lastPoll = 0;
 let titleTimer: ReturnType<typeof setInterval> | undefined;
 let liveTimer: ReturnType<typeof setInterval> | undefined;
-let tdiTimer: ReturnType<typeof setTimeout> | undefined;
 const runningTools = new Map<string, { name: string; target: string }>();
 let restorePiLensWidgetGuard: (() => void) | undefined;
 
@@ -556,10 +532,22 @@ function updateAssistantPhase(
 function updateAssistantTokenSamples(
   event: AssistantStreamEvent,
 ): void {
-  if (event && "delta" in event && event.delta) {
-    if (!perf.first) perf.first = Date.now();
+  if (
+    event &&
+    (event.type === "text_start" ||
+      event.type === "thinking_start" ||
+      event.type === "text_delta" ||
+      event.type === "thinking_delta") &&
+    !perf.first
+  )
+    perf.first = Date.now();
+  if (
+    event &&
+    (event.type === "text_delta" ||
+      event.type === "thinking_delta") &&
+    event.delta
+  )
     perf.chars += event.delta.length;
-  }
   if (event && "partial" in event) {
     const usage = event.partial.usage;
     const promptTokens =
@@ -611,24 +599,37 @@ function recordOutputRate(
       ? responseMs - firstTokenMs
       : responseMs;
   if (outputTokens <= 0 || generationMs <= 0) return;
-  perf.tps = outputTokens / (generationMs / 1000);
-  perf.peakTps = Math.max(perf.peakTps, perf.tps);
+  const rate = outputTokens / (generationMs / 1000);
+  // Server-backed models must not replace their authoritative rate with a
+  // slower client wall-clock estimate. Non-server providers still get the
+  // client fallback.
+  if (!perf.tpsServer && !swap.kind) {
+    perf.tps = rate;
+    perf.peakTps = Math.max(perf.peakTps, rate);
+  }
 }
 
 function recordAssistantPerformance(
   message: AssistantMessage,
 ): void {
-  if (!perf.start) return;
+  // The event is normally paired with message_start, but using the message's
+  // request timestamp keeps metrics working for providers/extensions that do
+  // not emit that event to every subscriber.
+  const requestStart = perf.start || message.timestamp;
+  if (!requestStart) return;
   const end = Date.now();
   perf.lastMs =
-    message.durationMs ?? Math.max(1, end - perf.start);
+    message.durationMs ?? Math.max(1, end - requestStart);
   const firstTokenMs = perf.first
-    ? Math.max(0, perf.first - perf.start)
+    ? Math.max(0, perf.first - requestStart)
     : 0;
   const responseMs = Math.max(1, perf.lastMs);
   recordPromptRate(message, firstTokenMs, responseMs);
   recordOutputRate(message, firstTokenMs, responseMs);
-  if (firstTokenMs > 0) perf.ttft = firstTokenMs;
+  // A llama-server timing is authoritative. Only use the client event timing
+  // when no server-side TTFT was observed for this response.
+  if (firstTokenMs > 0 && !perf.ttftServer)
+    perf.ttft = firstTokenMs;
   perf.start = 0;
 }
 
@@ -773,7 +774,6 @@ function resetSessionView(
   piLensState.languages.clear();
   piLensState.files.clear();
   piLensState.technicalDebt = undefined;
-  piLensState.tdiRequested = false;
   piLensState.available = pi.getCommands().some(
     (command: { name: string }) =>
       command.name?.replace(/^\/?/, "") === "lens-tdi",
@@ -786,31 +786,10 @@ function resetSessionView(
 }
 
 function startSessionTimers(
-  pi: ExtensionAPI,
   ctx: ExtensionContext,
 ): void {
   applyChrome(ctx);
   void probeModel(ctx).then(() => repaint()).catch(() => undefined);
-  clearTimeout(tdiTimer);
-  tdiTimer = undefined;
-  if (piLensState.available && !piLensState.tdiRequested) {
-    installTdiNotificationCapture(ctx);
-    piLensState.tdiRequested = true;
-    // Do not start a synthetic agent turn while session_start handlers are
-    // still initializing. Extensions such as herdr use agent_start and
-    // agent_settled to track the root session; firing here can make that
-    // startup turn look like the session exited.
-    tdiTimer = setTimeout(() => {
-      tdiTimer = undefined;
-      if (liveCtx !== ctx || ctx.mode !== "tui") return;
-      pi.sendUserMessage("/lens-tdi", {
-        expandPromptTemplates: true,
-      });
-      repaint();
-    }, 0);
-  }
-  if (piLensState.available && piLensState.tdiRequested)
-    repaint();
   clearInterval(metricsTimer);
   lastPoll = 0;
   metricsTimer = setInterval(() => {
@@ -858,7 +837,7 @@ export function registerSessionEvents(pi: ExtensionAPI): void {
     ) => {
       resetSessionView(pi, ctx);
       if (ctx.mode !== "tui") return;
-      startSessionTimers(pi, ctx);
+      startSessionTimers(ctx);
       bindSessionUi(ctx);
     },
   );
@@ -883,15 +862,8 @@ export function registerSessionEvents(pi: ExtensionAPI): void {
       ctx: ExtensionContext,
     ) => {
       liveCtx = ctx;
-      // Rates and timings belong to the selected model. Do not show the
-      // previous model's values while the new model is connecting.
-      Object.assign(perf, {
-        tps: 0,
-        pps: 0,
-        ttft: 0,
-        lastMs: 0,
-        peakTps: 0,
-      });
+      // Keep the last completed values visible while the new model connects.
+      // They are replaced only when fresh server/client measurements arrive.
       if (ctx.mode === "tui")
         void preloadModel(ctx, event.model).catch(
           () => undefined,
@@ -908,8 +880,6 @@ export function registerSessionEvents(pi: ExtensionAPI): void {
     titleTimer = undefined;
     clearInterval(liveTimer);
     liveTimer = undefined;
-    clearTimeout(tdiTimer);
-    tdiTimer = undefined;
     resetMonitorState();
     runningTools.clear();
     state.toolName = "";
@@ -947,7 +917,8 @@ export function registerMessageEvents(pi: ExtensionAPI): void {
       perf.chars = 0;
       perf.livePromptTokens = 0;
       perf.liveOutputTokens = 0;
-      perf.pps = 0;
+      perf.tpsServer = false;
+      perf.ttftServer = false;
       live.promptTokens = 0;
       live.promptAt = 0;
       live.tps = 0;

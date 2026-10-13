@@ -24,7 +24,6 @@ export const piLensState = {
   files: new Map<string, PiLensFindingCounts>(),
   technicalDebt: undefined as string | undefined,
   available: false,
-  tdiRequested: false,
 };
 
 export function isTechnicalDebtStatus(

@@ -23,7 +23,10 @@ interface MonitorPerf {
   start: number;
   first: number;
   tps: number;
+  tpsServer: boolean;
   pps: number;
+  ttft: number;
+  ttftServer: boolean;
   lastMs: number;
   peakTps: number;
 }
@@ -230,6 +233,7 @@ function parseUpstreamMetrics(
   ) {
     upstreamMetrics.promptPps = directPps;
     upstreamMetrics.promptPpsAt = now;
+    perf.pps = directPps;
   } else if (
     baselineReady &&
     promptTokens !== undefined &&
@@ -243,6 +247,7 @@ function parseUpstreamMetrics(
     if (tokenDelta > 0 && secondsDelta > 0) {
       upstreamMetrics.promptPps = tokenDelta / secondsDelta;
       upstreamMetrics.promptPpsAt = now;
+      perf.pps = upstreamMetrics.promptPps;
     }
   }
   if (
@@ -252,6 +257,9 @@ function parseUpstreamMetrics(
   ) {
     upstreamMetrics.tps = directTps;
     upstreamMetrics.tpsAt = now;
+    perf.tps = directTps;
+    perf.tpsServer = true;
+    perf.peakTps = Math.max(perf.peakTps, directTps);
   } else if (
     baselineReady &&
     outputTokens !== undefined &&
@@ -265,6 +273,9 @@ function parseUpstreamMetrics(
     if (tokenDelta > 0 && secondsDelta > 0) {
       upstreamMetrics.tps = tokenDelta / secondsDelta;
       upstreamMetrics.tpsAt = now;
+      perf.tps = upstreamMetrics.tps;
+      perf.tpsServer = true;
+      perf.peakTps = Math.max(perf.peakTps, upstreamMetrics.tps);
     }
   }
   if (promptTokens !== undefined)
@@ -444,6 +455,7 @@ function applySwapMetricAccumulator(
       swap.requestTps = accumulator.srvTps;
       swap.requestTpsAt = now;
       perf.tps = accumulator.srvTps;
+      perf.tpsServer = true;
       perf.peakTps = Math.max(perf.peakTps, accumulator.srvTps);
     }
   }
@@ -661,6 +673,7 @@ async function refreshSwapActivity(
       swap.requestTpsAt = observedAt;
       if (latest.tokens_per_second > 0) {
         perf.tps = latest.tokens_per_second;
+        perf.tpsServer = true;
         perf.peakTps = Math.max(
           perf.peakTps,
           latest.tokens_per_second,
@@ -1011,11 +1024,33 @@ function updateLiveSlot(slot: SwapSlot, now: number): void {
   updateLivePromptProgress(slot, promptTokens);
   updateLiveCache(slot);
   updateLivePromptRate(slot, promptTokens, now);
-  const serverTps = slot.timings?.predicted_per_second;
+  const predictedN = slot.timings?.predicted_n;
+  const predictedMs = slot.timings?.predicted_ms;
+  let serverTps: number | undefined;
+  if (
+    finiteNumber(slot.timings?.predicted_per_second) &&
+    slot.timings.predicted_per_second > 0
+  )
+    serverTps = slot.timings.predicted_per_second;
+  else if (
+    finiteNumber(predictedN) &&
+    predictedN > 0 &&
+    finiteNumber(predictedMs) &&
+    predictedMs > 0
+  )
+    serverTps = predictedN / (predictedMs / 1000);
   if (finiteNumber(serverTps) && serverTps > 0) {
     live.tps = serverTps;
     live.tpsAt = now;
     live.tpsServer = true;
+    perf.tps = serverTps;
+    perf.tpsServer = true;
+    perf.peakTps = Math.max(perf.peakTps, serverTps);
+  }
+  const serverTtft = slot.timings?.prompt_ms;
+  if (finiteNumber(serverTtft) && serverTtft > 0) {
+    perf.ttft = serverTtft;
+    perf.ttftServer = true;
   }
   live.tokens = finiteNumber(slot.n_prompt_tokens)
     ? slot.n_prompt_tokens
