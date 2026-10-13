@@ -22,8 +22,6 @@ import { loadSidepanelConfig, saveSidepanelConfig, clampPanelWidth, MAX_PANEL_WI
 import { showSwapStatus } from "./activity.js";
 import {
   displayPath,
-  isPiLensStatus,
-  isTechnicalDebtStatus,
   piLensState,
   rememberPiLensEvent,
 } from "./pilens.js";
@@ -41,6 +39,7 @@ import {
   probeModel,
   refreshLiveContext,
   refreshMetricsCycle,
+  refreshMetricsWithActivity,
   resetMonitorState,
   swap,
   swapGet,
@@ -637,7 +636,7 @@ function refreshMetricsAfterMessage(
   messageTimestamp: number,
 ): void {
   setTimeout(() => {
-    void refreshMetricsCycle(true, messageTimestamp).then(repaint);
+    void refreshMetricsWithActivity(messageTimestamp).then(repaint);
   }, 300);
 }
 

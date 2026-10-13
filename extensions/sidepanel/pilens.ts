@@ -170,6 +170,10 @@ export function piLensTdiFromRecord(
 
 function rememberPiLensPath(path: string): void {
   piLensState.currentFile = path;
+  // A file edit invalidates its previous diagnostics. Keep the panel from
+  // showing a warning that belonged to an older version of the file while
+  // Pi-Lens is still preparing the replacement result.
+  piLensState.files.delete(path);
   const language = piLensLanguage(path);
   if (language) piLensState.languages.add(language);
 }
@@ -299,10 +303,10 @@ export function rememberPiLensEvent(data: JsonValue): void {
 }
 
 export function handlePiLensEvent(
-  raw: unknown,
+  raw: WireValue,
   repaint: () => void,
 ): void {
-  const decoded = decodeWireValue(raw as WireValue);
+  const decoded = decodeWireValue(raw);
   if (decoded !== undefined) {
     const record = jsonObject(decoded);
     let scalar = jsonString(decoded);
@@ -343,7 +347,7 @@ export function registerPiLensEvents(
     "pi-lens/technical-debt",
   ];
   for (const channel of channels)
-    pi.events.on(channel, (...args: unknown[]) =>
-      handlePiLensEvent(args[0], repaint),
+    pi.events.on(channel, (data) =>
+      handlePiLensEvent(data as WireValue, repaint),
     );
 }

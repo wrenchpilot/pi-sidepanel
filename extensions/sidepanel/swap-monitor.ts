@@ -706,11 +706,10 @@ let metricsCycleInFlight: Promise<void> | undefined;
 let metricsActivityPending = false;
 let metricsActivityAfter = 0;
 
-export function refreshMetricsCycle(
-  includeActivity = false,
-  activityAfter = 0,
+function startMetricsCycle(
+  activityAfter: number | undefined,
 ): Promise<void> {
-  if (includeActivity) {
+  if (activityAfter !== undefined) {
     metricsActivityPending = true;
     metricsActivityAfter = Math.max(
       metricsActivityAfter,
@@ -742,6 +741,16 @@ export function refreshMetricsCycle(
   });
   metricsCycleInFlight = tracked;
   return tracked;
+}
+
+export function refreshMetricsCycle(): Promise<void> {
+  return startMetricsCycle(undefined);
+}
+
+export function refreshMetricsWithActivity(
+  activityAfter = 0,
+): Promise<void> {
+  return startMetricsCycle(activityAfter);
 }
 
 /* ── live context ── */
@@ -1154,7 +1163,7 @@ export async function connectSwap(
     resetSwapObservation();
   swap.base = base;
   swap.headers = headers;
-  void refreshMetricsCycle(true);
+  void refreshMetricsWithActivity();
   if (swap.kind === "ninfer") return true;
   // Use a snapshot: another model can be selected while the alias request is in flight.
   const get = (path: string) =>
@@ -1166,7 +1175,7 @@ export async function connectSwap(
   )
     return false;
   swap.realId = aliases.get(id) ?? id;
-  void refreshMetricsCycle(true);
+  void refreshMetricsWithActivity();
   return true;
 }
 
