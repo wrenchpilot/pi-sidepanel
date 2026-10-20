@@ -9,6 +9,7 @@ import {
   fmtMs,
   fmtTokens,
 } from "../extensions/sidepanel/format.ts";
+import { estimateLivePromptRate } from "../extensions/sidepanel/prompt-rate.ts";
 
 test("parsePrometheusSamples parses comments, labels, and timestamps", () => {
   const samples = parsePrometheusSamples(
@@ -33,6 +34,18 @@ test("normalizeServiceBase removes trailing and v1 path segments", () => {
     normalizeServiceBase("http://localhost:8000/v1///"),
     "http://localhost:8000",
   );
+});
+
+test("live prompt rate uses cumulative tokens over elapsed processing time", () => {
+  const rate = estimateLivePromptRate(8192, 1000, 29440);
+
+  assert.ok(rate !== undefined);
+  assert.ok(Math.abs(rate - 288) < 0.1);
+});
+
+test("live prompt rate waits for a meaningful sample", () => {
+  assert.equal(estimateLivePromptRate(2048, 1000, 1100), undefined);
+  assert.equal(estimateLivePromptRate(0, 1000, 2000), undefined);
 });
 
 test("format helpers preserve compact display units", () => {

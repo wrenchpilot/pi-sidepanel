@@ -6,6 +6,10 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadSidepanelConfig, nonNegativeNumber, saveSidepanelConfig } from "./config.js";
 import type { ActivityRow } from "./activity.js";
 import {
+  estimateLivePromptRate,
+  MIN_PROMPT_SAMPLE_MS,
+} from "./prompt-rate.js";
+import {
   metricValue,
   normalizeServiceBase,
   parsePrometheusSamples,
@@ -13,7 +17,6 @@ import {
 
 const LOAD_DEFAULT_MS = 60000;
 const LIVE_STALE_MS = 5000;
-const MIN_PROMPT_SAMPLE_MS = 250;
 const ACTIVITY_CLOCK_SKEW_MS = 30000;
 
 function isTransientUpstreamStatus(status: number): boolean {
@@ -1067,7 +1070,6 @@ function updateLivePromptRate(
   slot: SwapSlot,
   promptTokens: number,
   now: number,
-  sample: LiveSlotSample,
   promptIsFinished: boolean,
 ): void {
   const serverPps = slot.timings?.prompt_per_second;
@@ -1092,24 +1094,14 @@ function updateLivePromptRate(
     rate = timingPromptN / (timingPromptMs / 1000);
     server = true;
   } else if (!promptIsFinished && promptTokens > 0) {
-    const previous =
-      previousLiveSlotSample?.key === sample.key
-        ? previousLiveSlotSample
-        : undefined;
-    const elapsed = previous
-      ? (now - previous.at) / 1000
-      : perf.start
-        ? (now - perf.start) / 1000
-        : 0;
-    const delta = previous
-      ? promptTokens - previous.promptTokens
-      : promptTokens;
-    if (
-      elapsed >= MIN_PROMPT_SAMPLE_MS / 1000 &&
-      delta > 0
-    ) {
-      rate = delta / elapsed;
-    }
+    // Slot counters are cumulative, while per-poll deltas can arrive in
+    // batch-sized bursts and falsely look like the server's prompt speed.
+    const cumulativeRate = estimateLivePromptRate(
+      promptTokens,
+      perf.start,
+      now,
+    );
+    if (cumulativeRate !== undefined) rate = cumulativeRate;
   }
   live.promptTokens = promptTokens;
   if (rate > 0) {
@@ -1145,7 +1137,6 @@ function updateLiveSlot(slot: SwapSlot, now: number): void {
     slot,
     promptTokens,
     now,
-    sample,
     promptIsFinished,
   );
   const predictedN = slot.timings?.predicted_n;
